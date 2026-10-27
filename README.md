@@ -18,7 +18,8 @@ Built for **Arch Linux + PipeWire**. It works as a *layer*: a virtual microphone
 ## Install (Arch)
 
 ```sh
-git clone <this repo> && cd real-time-speech-to-binharic-translator
+git clone -b claude/happy-gates-btt1f9 https://github.com/tadwal09-dev/real-time-speech-to-binharic-translator.git
+cd real-time-speech-to-binharic-translator
 ./install.sh
 ```
 
