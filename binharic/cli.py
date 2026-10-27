@@ -273,6 +273,24 @@ def _gpu_checks():
              "rerun ./install.sh  (or run on the CPU: --device cpu)")]
 
 
+def _audio_checks():
+    from . import pulse
+    if not pulse.available():
+        return []
+    src, sink = pulse.real_source(), pulse.real_sink()
+    out = [(f"speakers: {pulse.describe(sink, 'sinks')}", bool(sink), "no output device found (pavucontrol)")]
+    if not src:
+        return out + [("microphone", False, "no input device found: plug one in / check pavucontrol")]
+    say_line(f"  [dim]… listening to {pulse.describe(src, 'sources')} for a second[/]")
+    peak = pulse.probe_source(src, 1.0)
+    label = f"microphone: {pulse.describe(src, 'sources')}"
+    if peak is None:
+        return out + [(label, False, "couldn't record from it")]
+    ok = peak >= 3e-4
+    return out + [(label + f"  (level {peak:.3f})", ok,
+                   "silent: unmute it / pick the right input in pavucontrol, or --source NAME")]
+
+
 def cmd_doctor(args):
     from . import pulse, stt
 
@@ -297,6 +315,7 @@ def cmd_doctor(args):
         ("rich (pretty CLI)", mod("rich"), "rerun ./install.sh"),
         ("notify-send", bool(shutil.which("notify-send")), "sudo pacman -S libnotify"),
     ]
+    checks += _audio_checks()
     for name, ok, fix in checks:
         say_line(f"  {'[green]✔[/]' if ok else '[red]✖[/]'} {name}" + ("" if ok else f"  [dim]→ {fix}[/]"),
                  f"  {'ok ' if ok else 'MISSING'} {name}" + ("" if ok else f"  -> {fix}"))

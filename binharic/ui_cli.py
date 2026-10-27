@@ -29,6 +29,9 @@ class Printer:
         self.console = Console(highlight=False) if Console else None
         self._partial = ""
         self._lock = threading.Lock()
+        self._meter_at = 0.0
+        self._speaking = False
+        self._tty = sys.stdout.isatty()
 
     def _out(self, markup: str, plain: str):
         with self._lock:
@@ -43,6 +46,21 @@ class Printer:
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
             self._partial = ""
+
+    def _meter(self, level: float):
+        """In-place mic meter, so you can see whether you're being heard."""
+        now = time.monotonic()
+        if now - self._meter_at < 0.1:
+            return
+        self._meter_at = now
+        with self._lock:
+            if self._partial and self._partial != "\0meter":
+                return  # a live transcript is showing; leave it
+            n = int(min(1.0, (level * 12) ** 0.6) * 24)
+            state = "\033[33mhearing you…\033[0m" if self._speaking else "\033[2msay something\033[0m"
+            sys.stdout.write(f"\r\033[K  mic \033[32m{'█' * n}\033[2m{'░' * (24 - n)}\033[0m {state}")
+            sys.stdout.flush()
+            self._partial = "\0meter"
 
     def _timing(self, ev: dict):
         if "latency_ms" not in ev:
@@ -68,6 +86,10 @@ class Printer:
             self._out(f"[dim]{t}[/] [{style}]⚙ {_esc(ev['text'])}[/]", f"{t} * {ev['text']}")
         elif kind == "error":
             self._out(f"[dim]{t}[/] [bold red]✖ {_esc(ev['text'])}[/]", f"{t} ! {ev['text']}")
+        elif kind == "speech":
+            self._speaking = ev["speaking"]
+        elif kind == "level" and self.test and self._tty:
+            self._meter(ev["level"])
         elif kind == "partial":
             with self._lock:
                 text = ev["text"]

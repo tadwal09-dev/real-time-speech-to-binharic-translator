@@ -125,7 +125,8 @@ class WhisperEngine(Engine):
 
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
-        threads = max(1, min(os.cpu_count() or 4, 16))  # CTranslate2 defaults to 4
+        # all cores but one (CTranslate2 defaults to 4): the spare one keeps audio glitch-free
+        threads = max(1, min((os.cpu_count() or 4) - 1, 16))
 
         def load(name):
             return WhisperModel(name, device=device, compute_type=compute_type, cpu_threads=threads,

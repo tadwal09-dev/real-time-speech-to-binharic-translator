@@ -29,7 +29,7 @@ from typing import Callable
 
 import numpy as np
 
-from . import codec, modem
+from . import codec, modem, pulse
 from .audio import Input, Output
 from .stt import LIVE, PHRASE, STT_SR, Transcriber, make_engine
 from .vad import Decimator
@@ -135,6 +135,9 @@ class Translator:
         self._sock: socket.socket | None = None
         self._warned_half = False
         self.fatal: str | None = None
+        self.speakers: str | None = None
+        self.speakers_label = "default output"
+        self.mic_label = "default input"
         self._stopped_once = False
         self._local_out: Output | None = None
         self._air_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=600)
@@ -223,6 +226,8 @@ class Translator:
         self.s.test = on
         if air is not None:
             self.s.test_air = air
+        if on and self._out is not None:
+            self._target()
         if on:
             self.log("TEST MODE: say something. The screech plays on your speakers "
                      "(not the Binharic Mic) and is decoded back to check it")
@@ -253,8 +258,14 @@ class Translator:
     def start(self) -> None:
         if self.s.control_socket:
             self._start_control()  # first, so a second copy fails before touching audio
-        self._out = Output(SR, sink=self.s.sink, device=self.s.output_device, blocksize=BLOCK)
+        self._resolve_devices()
+        self._out = Output(SR, sink=self.s.sink or self.speakers, device=self.s.output_device, blocksize=BLOCK)
         self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2)
+        out = pulse.describe(self.s.sink, "sinks") if self.s.sink else self.speakers_label
+        self.log(f"mic: {self.mic_label}  →  screech: {out}"
+                 + (f"  (test mode plays on: {self.speakers_label})" if self.s.test and self.s.sink else ""))
+        if self.s.test:
+            self._target()  # open the speakers now, not on the first screech
         self._spawn(self._out_loop, "out")
         self._spawn(self._air_loop, "air")
         self._spawn(self._mic_loop, "mic")
@@ -323,6 +334,25 @@ class Translator:
         t.start()
         self._threads.append(t)
 
+    def _resolve_devices(self) -> None:
+        """On PipeWire, talk to it directly (parec/pacat) for the mic and the
+        speakers too: PortAudio through ALSA is unreliable there. Also make
+        sure "your mic" isn't our own virtual mic, and "your speakers" aren't
+        the virtual sink, in case PipeWire made them the defaults."""
+        self.speakers = None
+        self.speakers_label = "default output"
+        self.mic_label = self.s.input_device or "default input"
+        if not pulse.available():
+            return
+        if not self.s.source and not self.s.input_device:
+            self.s.source = pulse.real_source()
+        if self.s.source:
+            self.mic_label = pulse.describe(self.s.source, "sources")
+        if not self.s.output_device:
+            self.speakers = pulse.real_sink()
+            if self.speakers:
+                self.speakers_label = pulse.describe(self.speakers, "sinks")
+
     # -- threads ----------------------------------------------------------
     def _mic_loop(self):
         while not self._stop.is_set():
@@ -358,14 +388,23 @@ class Translator:
         self.ready = True
         if getattr(engine, "notice", ""):
             self.log(engine.notice, "warn")
-        self.log(f"ready ({self.engine_name})")
+        self.log(f"ready ({self.engine_name})" + (" · say something" if self.s.test else ""))
         self._changed()
         last_level = 0.0
+        ready_at = last_block = time.monotonic()
+        peak = 0.0
+        warned_dead = warned_silent = False
         while not self._stop.is_set():
             try:
                 blocks = [self._mic_q.get(timeout=0.2)]
             except queue.Empty:
+                if not warned_dead and time.monotonic() - last_block > 3:
+                    warned_dead = True
+                    self.log(f"the microphone ({self.mic_label}) isn't delivering any audio. Check it with "
+                             "`binharic doctor`, pick another with `binharic devices` + --source NAME, "
+                             "or in pavucontrol", "error")
                 continue
+            last_block = time.monotonic()
             # drain whatever piled up while recognition was busy
             while True:
                 try:
@@ -375,6 +414,14 @@ class Translator:
             self._last_arrival = blocks[-1][1]
             blocks = [b for b, _ in blocks]
             audio = np.concatenate(blocks)
+            if not warned_silent and not self.screeching.is_set():
+                peak = max(peak, float(np.abs(audio).max()))
+                if time.monotonic() - ready_at > 5:
+                    warned_silent = True
+                    if peak < 3e-4:
+                        self.log(f"the microphone ({self.mic_label}) is silent: is it muted or the wrong "
+                                 "device? `binharic devices` lists inputs (use --source NAME), or fix it in "
+                                 "pavucontrol", "error")
             if not (self.s.enabled or self.s.test):
                 if self.s.passthrough:
                     for b in blocks:
@@ -430,7 +477,7 @@ class Translator:
         if not self.s.test or not self.s.sink:
             return self._out
         if self._local_out is None:
-            self._local_out = Output(SR, sink=None, device=self.s.output_device, blocksize=BLOCK)
+            self._local_out = Output(SR, sink=self.speakers, device=self.s.output_device, blocksize=BLOCK)
         return self._local_out
 
     def _out_loop(self):
@@ -450,7 +497,14 @@ class Translator:
             else:
                 while not self._voice_q.empty():  # stale voice must never leak later
                     self._voice_q.get_nowait()
-            out.write(block if block is not None else silence)
+            if block is not None:
+                out.write(block)
+            elif out.needs_feeding:
+                out.write(silence)
+            else:
+                # PipeWire/Pulse: leave the buffer empty while idle, so a new
+                # screech doesn't queue up behind buffered silence
+                time.sleep(0.005)
 
     def _play_text(self, out: Output, text: str, meta: dict | None = None):
         meta = meta or {}
@@ -470,23 +524,13 @@ class Translator:
         lead = modem.lead_in(SR, s.volume)
         try:
             for n, chunk in enumerate(chunks):
-                # the sync chirp is the same for every message: start it right away
-                # and synthesise the body while it plays
-                result = {}
-
-                def synth(chunk=chunk):
-                    t = time.monotonic()
-                    result["body"] = modem.encode_body(chunk, s.mode, key=s.key, sr=SR,
-                                                       speed=s.speed, volume=s.volume)
-                    result["ms"] = (time.monotonic() - t) * 1000
-
-                worker = threading.Thread(target=synth, daemon=True)
-                worker.start()
-                first_sound = time.monotonic()
-                for i in range(0, len(lead), BLOCK):  # 180 ms of chirp covers the synthesis
-                    out.write(lead[i:i + BLOCK])
-                worker.join()
-                body, synth_ms = result["body"], result["ms"]
+                # synthesise the whole message before playing any of it: a gap
+                # in the middle (the speaker running dry while we compute)
+                # corrupts the screech, so this is worth the ~50 ms
+                t = time.monotonic()
+                body = modem.encode_body(chunk, s.mode, key=s.key, sr=SR, speed=s.speed, volume=s.volume)
+                synth_ms = (time.monotonic() - t) * 1000
+                first_sound = time.monotonic() + out.latency  # when it actually leaves the speaker
                 info = dict(text=chunk, hex=codec.to_hex(chunk), binary=codec.to_binary(chunk),
                             seconds=(len(lead) + len(body)) / SR, mode=s.mode, synth_ms=synth_ms,
                             test=s.test)
@@ -494,14 +538,15 @@ class Translator:
                     info.update(latency_ms=(first_sound - meta["stopped_at"]) * 1000,
                                 stt_ms=meta["stt_ms"], speculative=meta["speculative"])
                 self.emit("sent", **info)
-                audio = body
+                audio = np.concatenate([lead, body])
                 if s.test:
                     self._verify(chunk, np.concatenate([lead, body]), s.mode, s.key, s.speed)
-                for i in range(0, len(audio), BLOCK):
+                step = BLOCK * 5  # 100 ms writes: fewer wake-ups for a busy CPU to miss
+                for i in range(0, len(audio), step):
                     if self._abort.is_set() or self._stop.is_set():
                         self.log("screech cut off")
                         return
-                    out.write(audio[i:i + BLOCK])
+                    out.write(audio[i:i + step])
         finally:
             self._mute_until = time.monotonic() + 0.4  # speaker/room tail
             self.screeching.clear()

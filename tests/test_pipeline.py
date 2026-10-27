@@ -119,6 +119,9 @@ class FakeIn:
 
 
 class FakeOut:
+    needs_feeding = True
+    latency = 0.0
+
     def __init__(self):
         self.blocks = []
 

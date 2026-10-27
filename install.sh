@@ -16,6 +16,9 @@ VENV=$DATA/venv
 BIN_DIR=~/.local/bin
 BIN=$BIN_DIR/binharic
 
+# big downloads (CUDA, models) can drop mid-way: retry a few times
+retry() { local i; for i in 1 2 3; do "$@" && return 0; echo "   retrying ($i/3)…"; sleep 3; done; return 1; }
+export UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-600}
 step() { printf '\n\033[1;31m::\033[0m \033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\n\033[1;31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -43,7 +46,7 @@ if [[ ! -x "$VENV/bin/python" ]] || ! "$VENV/bin/python" -c "import sys; sys.exi
 fi
 
 step "installing binharic + Whisper speech recognition (first time: a few hundred MB)"
-if ! uv pip install --python "$VENV/bin/python" --upgrade '.[all]'; then
+if ! retry uv pip install --python "$VENV/bin/python" --upgrade '.[all]'; then
   echo "!! Whisper failed to install (see the error above); installing the lighter Vosk engine instead"
   uv pip install --python "$VENV/bin/python" --upgrade '.[vosk]' || fail "installation failed (see the error above)"
   ENGINE=vosk
@@ -52,7 +55,7 @@ else
 fi
 if [[ $ENGINE == whisper && -e /proc/driver/nvidia/version && -z "${BINHARIC_NO_GPU:-}" ]]; then
   step "NVIDIA GPU found: installing CUDA 12 libraries for Whisper (~1.5 GB, skip with BINHARIC_NO_GPU=1)"
-  uv pip install --python "$VENV/bin/python" --upgrade '.[all,gpu]' \
+  retry uv pip install --python "$VENV/bin/python" --upgrade '.[all,gpu]' \
     || echo "!! couldn't install the CUDA libraries; Whisper will run on the CPU instead"
 fi
 ln -sf "$VENV/bin/binharic" "$BIN"
@@ -66,9 +69,9 @@ systemctl --user daemon-reload 2>/dev/null || true
 
 step "downloading speech models ($ENGINE)"
 if [[ $ENGINE == whisper ]]; then
-  "$BIN" download-model --engine whisper || fail "model download failed (network?) - rerun ./install.sh"
+  retry "$BIN" download-model --engine whisper || fail "model download failed (network?) - rerun ./install.sh"
 else
-  "$BIN" download-model --engine vosk || fail "model download failed (network?) - rerun ./install.sh"
+  retry "$BIN" download-model --engine vosk || fail "model download failed (network?) - rerun ./install.sh"
 fi
 
 step "creating the Binharic Mic"

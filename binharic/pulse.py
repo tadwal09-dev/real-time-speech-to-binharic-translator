@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 
@@ -82,3 +83,80 @@ def resolve_source(value: str | None) -> str | None:
     if value in ("speakers", "monitor"):
         return default_sink_monitor()
     return value or None
+
+
+def _info(kind: str) -> list[dict]:
+    """[{name, description}] for sinks or sources."""
+    try:
+        data = json.loads(_pactl("-f", "json", "list", kind))
+        return [{"name": d.get("name", ""), "description": d.get("description", d.get("name", ""))} for d in data]
+    except Exception:
+        try:
+            return [{"name": n, "description": n} for n in _names(kind)]
+        except Exception:
+            return []
+
+
+def describe(name: str | None, kind: str) -> str:
+    for d in _info(kind):
+        if d["name"] == name:
+            return d["description"]
+    return name or "default"
+
+
+def _default(kind: str) -> str | None:
+    try:
+        return _pactl(f"get-default-{kind}").strip() or None
+    except Exception:
+        return None
+
+
+def real_source() -> str | None:
+    """Your actual microphone: the default source, unless that is our own
+    virtual mic or a monitor (PipeWire may switch the default to a newly
+    created device), in which case the first real input."""
+    if not available():
+        return None
+    ours = lambda n: n == MIC or n.endswith(".monitor") or n.startswith(SINK)  # noqa: E731
+    d = _default("source")
+    if d and not ours(d):
+        return d
+    return _best([s["name"] for s in _info("sources") if not ours(s["name"])], ("alsa_input", "bluez_input"))
+
+
+def _best(names: list[str], hardware: tuple[str, ...]) -> str | None:
+    """Prefer real hardware over other virtual devices."""
+    for n in names:
+        if n.startswith(hardware):
+            return n
+    return names[0] if names else None
+
+
+def real_sink() -> str | None:
+    """Your speakers/headphones: the default sink unless it is our virtual one."""
+    if not available():
+        return None
+    d = _default("sink")
+    if d and d != SINK:
+        return d
+    return _best([s["name"] for s in _info("sinks") if s["name"] != SINK], ("alsa_output", "bluez_output"))
+
+
+def probe_source(name: str, seconds: float = 1.0, rate: int = 16000) -> float | None:
+    """Record briefly and return the peak level (0..1), or None if recording failed."""
+    if not shutil.which("parec"):
+        return None
+    import time
+    try:
+        p = subprocess.Popen(["parec", f"--device={name}", "--raw", "--format=s16le", f"--rate={rate}", "--latency-msec=20",
+                              "--channels=1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    time.sleep(seconds)
+    p.terminate()
+    raw, _ = p.communicate(timeout=3)
+    if len(raw) < 2:
+        return None
+    import numpy as np
+    x = np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2")
+    return float(np.abs(x).max()) / 32768.0

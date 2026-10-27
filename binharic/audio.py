@@ -36,14 +36,20 @@ def _require(tool: str) -> str:
 class Output:
     """Blocking mono float32 sink. ``write`` returns once the audio is queued."""
 
+    # a buffer deep enough that a busy CPU (Whisper!) can't starve the screech
+    PACAT_LATENCY_MS = 100
+
     def __init__(self, sr: int, sink: str | None = None, device=None, blocksize: int = 1024):
         self.sr = sr
         self.blocksize = blocksize
         self._proc = self._stream = None
+        # PortAudio wants a steady stream of writes; pacat is happy to sit idle
+        self.needs_feeding = not sink
+        self.latency = self.PACAT_LATENCY_MS / 1000 if sink else 0.0
         if sink:
             self._proc = subprocess.Popen(
                 [_require("pacat"), "--playback", f"--device={sink}", "--raw", "--format=s16le",
-                 f"--rate={sr}", "--channels=1", "--latency-msec=25",
+                 f"--rate={sr}", "--channels=1", f"--latency-msec={self.PACAT_LATENCY_MS}",
                  "--client-name=binharic", "--stream-name=binharic"],
                 stdin=subprocess.PIPE)
             _small_pipe(self._proc.stdin)
@@ -52,6 +58,7 @@ class Output:
             self._stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32",
                                            device=device, blocksize=blocksize, latency="low")
             self._stream.start()
+            self.latency = float(self._stream.latency)
 
     def write(self, samples: np.ndarray) -> None:
         samples = np.asarray(samples, dtype=np.float32).ravel()
