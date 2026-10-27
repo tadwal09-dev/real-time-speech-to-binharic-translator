@@ -261,16 +261,16 @@ def cmd_doctor(args):
             return False
 
     checks = [
-        ("numpy", mod("numpy"), "pipx install ."),
+        ("numpy", mod("numpy"), "rerun ./install.sh"),
         ("sounddevice / PortAudio", mod("sounddevice"), "sudo pacman -S portaudio"),
         ("pactl / pacat (PipeWire)", bool(shutil.which("pactl") and shutil.which("pacat")),
          "sudo pacman -S libpulse pipewire-pulse"),
         ("PipeWire/Pulse server", pulse.available(), "systemctl --user start pipewire-pulse"),
         ("Binharic Mic", pulse.virtual_mic_exists(), "binharic mic up"),
-        ("Whisper (faster-whisper)", stt.have_whisper(), "pipx inject binharic faster-whisper"),
-        ("Vosk", mod("vosk"), "pipx inject binharic vosk"),
+        ("Whisper (faster-whisper)", stt.have_whisper(), "rerun ./install.sh"),
+        ("Vosk", mod("vosk"), "rerun ./install.sh"),
         ("Tk (for the GUI)", mod("tkinter"), "sudo pacman -S tk"),
-        ("rich (pretty CLI)", mod("rich"), "pipx inject binharic rich"),
+        ("rich (pretty CLI)", mod("rich"), "rerun ./install.sh"),
         ("notify-send", bool(shutil.which("notify-send")), "sudo pacman -S libnotify"),
     ]
     for name, ok, fix in checks:

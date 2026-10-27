@@ -24,13 +24,15 @@ cd real-time-speech-to-binharic-translator
 ```
 
 The installer does five things:
-- installs `portaudio libpulse tk python-pipx libnotify` with pacman
-- installs the `binharic` command into `~/.local/bin` with pipx
+- installs `portaudio libpulse tk libnotify uv` with pacman
+- builds a private Python 3.12 environment with uv in `~/.local/share/binharic/venv`,
+  so it doesn't matter which Python Arch ships, and links `binharic` into `~/.local/bin`
 - downloads the offline Whisper models (`small.en` and `base.en`, about 600 MB)
 - creates the Binharic Mic
 - runs `binharic doctor` to check everything
 
-Nothing you say is sent to the cloud.
+Nothing you say is sent to the cloud. To update, `git pull` and run `./install.sh`
+again. `./install.sh --uninstall` removes it.
 
 ## Three ways to run it
 
