@@ -276,3 +276,54 @@ def test_test_mode_plays_locally_verifies_and_times(monkeypatch, tmp_path):
     assert not sink_out.blocks or np.abs(np.concatenate(sink_out.blocks)).max() == 0
     played = np.concatenate(local.blocks)
     assert [m.text for m in modem.decode_audio(played, sr, key="k")] == ["testing one two"]
+
+
+def test_whisper_falls_back_to_cpu_when_cuda_libs_are_missing(monkeypatch):
+    import sys
+    import types
+
+    from binharic import gpu, stt
+
+    made = []
+
+    class FakeWhisperModel:
+        def __init__(self, name, device, compute_type, **kw):
+            made.append((name, device, compute_type))
+            self.device = device
+
+        def transcribe(self, audio, **kw):
+            if self.device == "cuda":  # what your machine did: fails on first use
+                raise RuntimeError("Library libcublas.so.12 is not found or cannot be loaded")
+            return iter([]), None
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeWhisperModel))
+    monkeypatch.setattr(gpu, "cuda_devices", lambda: 1)
+    monkeypatch.setattr(gpu, "preload_cuda_libs", lambda: False)
+    eng = stt.WhisperEngine("base.en", device="auto", live_model=None)
+    assert eng.device == "cpu" and "CPU" in eng.label
+    assert "libcublas" in eng.notice and "install.sh" in eng.notice
+    assert made == [("base.en", "cuda", "float16"), ("base.en", "cpu", "int8")]
+    # asking for the GPU explicitly still fails loudly
+    with pytest.raises(RuntimeError):
+        stt.WhisperEngine("base.en", device="cuda", live_model=None)
+
+
+def test_fatal_engine_error_stops_the_layer(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(core, "Input", FakeIn(np.zeros(48000 * 5, np.float32)))
+    monkeypatch.setattr(core, "Output", FakeOut())
+
+    def boom(*a, **k):
+        raise RuntimeError("Library libcublas.so.12 is not found")
+
+    monkeypatch.setattr(core, "make_engine", boom)
+    tr = core.Translator(core.Settings())
+    tr.start()
+    deadline = time.time() + 5
+    while not tr.stopped and time.time() < deadline:
+        time.sleep(0.02)
+    t = time.time()
+    tr.stop()
+    tr.stop()  # idempotent
+    assert tr.stopped and "libcublas" in tr.fatal
+    assert time.time() - t < 1.0

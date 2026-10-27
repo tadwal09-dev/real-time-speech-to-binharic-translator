@@ -14,6 +14,8 @@ dependencies = ["numpy>=1.22", "sounddevice>=0.4", "rich>=12"]
 whisper = ["faster-whisper>=1.0"]
 vosk = ["vosk>=0.3.45"]
 all = ["faster-whisper>=1.0", "vosk>=0.3.45"]
+# NVIDIA GPU: CUDA 12 cuBLAS + cuDNN 9 for CTranslate2 (loaded by binharic.gpu)
+gpu = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
 test = ["pytest"]
 
 [project.scripts]

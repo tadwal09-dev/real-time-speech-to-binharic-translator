@@ -50,6 +50,11 @@ if ! uv pip install --python "$VENV/bin/python" --upgrade '.[all]'; then
 else
   ENGINE=whisper
 fi
+if [[ $ENGINE == whisper && -e /proc/driver/nvidia/version && -z "${BINHARIC_NO_GPU:-}" ]]; then
+  step "NVIDIA GPU found: installing CUDA 12 libraries for Whisper (~1.5 GB, skip with BINHARIC_NO_GPU=1)"
+  uv pip install --python "$VENV/bin/python" --upgrade '.[all,gpu]' \
+    || echo "!! couldn't install the CUDA libraries; Whisper will run on the CPU instead"
+fi
 ln -sf "$VENV/bin/binharic" "$BIN"
 "$BIN" --help >/dev/null || fail "binharic was installed but doesn't start"
 

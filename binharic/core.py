@@ -92,7 +92,8 @@ def send_command(cmd: str, timeout: float = 3.0) -> str:
     s.settimeout(timeout)
     try:
         s.connect(str(socket_path()))
-    except (FileNotFoundError, ConnectionRefusedError):
+    except OSError:
+        s.close()
         raise RuntimeError("binharic is not running (start `binharic listen`, `tui` or `gui`)") from None
     with s:
         s.sendall(cmd.encode() + b"\n")
@@ -133,6 +134,8 @@ class Translator:
         self._hear_in: Input | None = None
         self._sock: socket.socket | None = None
         self._warned_half = False
+        self.fatal: str | None = None
+        self._stopped_once = False
         self._local_out: Output | None = None
         self._air_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=600)
         self._mute_until = 0.0
@@ -261,15 +264,27 @@ class Translator:
         self._changed()
 
     def stop(self) -> None:
+        if self._stopped_once:
+            return
+        self._stopped_once = True
         self._stop.set()
         self._abort.set()
+        if self._sock:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)  # wakes the thread blocked in accept()
+            except OSError:
+                pass
+        # let the threads finish their current block before closing the devices
+        # under them (closing a PortAudio stream mid-read can crash)
+        deadline = time.monotonic() + 1.5
+        for t in self._threads:
+            if t is not threading.current_thread():
+                t.join(timeout=max(0.05, deadline - time.monotonic()))
         for closer in (self._mic, self._hear_in):
             try:
                 closer and closer.close()
             except Exception:
                 pass
-        for t in self._threads:
-            t.join(timeout=2)
         for out in {id(o): o for o in (self._out, self._local_out) if o}.values():
             try:
                 out.close()
@@ -296,8 +311,14 @@ class Translator:
                 fn()
             except Exception as e:
                 if not self._stop.is_set():
+                    if os.environ.get("BINHARIC_DEBUG"):
+                        traceback.print_exc()
                     self.emit("error", text=f"{name}: {e}")
-                    traceback.print_exc()
+                    if name in ("stt", "mic", "out"):
+                        # the layer can't work without these: say so and shut down
+                        # instead of sitting there looking alive
+                        self.fatal = f"{name} failed: {e}"
+                        self._stop.set()
         t = threading.Thread(target=run, name=f"binharic-{name}", daemon=True)
         t.start()
         self._threads.append(t)
@@ -335,7 +356,9 @@ class Translator:
         while not self._mic_q.empty():  # don't transcribe what was said while loading
             self._mic_q.get_nowait()
         self.ready = True
-        self.log(f"ready ({engine.name})")
+        if getattr(engine, "notice", ""):
+            self.log(engine.notice, "warn")
+        self.log(f"ready ({self.engine_name})")
         self._changed()
         last_level = 0.0
         while not self._stop.is_set():

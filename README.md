@@ -115,6 +115,12 @@ accurate than the old Vosk engine and copes with accents and odd words. It uses 
 | Non-English | `--model small` or `--model large-v3` (multilingual) |
 | Very light, lower accuracy | `--engine vosk` (needs `binharic download-model --engine vosk`) |
 
+**NVIDIA GPUs** are used automatically. When `install.sh` sees an NVIDIA driver, it adds
+the CUDA 12 libraries Whisper needs (about 1.5 GB, into binharic's own environment, so
+your system CUDA is untouched; skip this with `BINHARIC_NO_GPU=1 ./install.sh`). If the
+GPU can't be used, binharic says why and runs on the CPU instead. `binharic doctor` shows
+the GPU status, and `--device cpu` forces the CPU.
+
 For reference, on a 4-core CPU `small.en` takes about 3 s to transcribe 5 s of speech
 and `base.en` takes about 1 s.
 

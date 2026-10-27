@@ -73,9 +73,22 @@ def _translator(args):
     return Translator(_settings(args))
 
 
+def _run_ui(run, tr, **kw):
+    try:
+        run(tr, **kw)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            tr.stop()
+        except KeyboardInterrupt:
+            pass
+    return tr.fatal
+
+
 def cmd_listen(args):
     from . import ui_cli
-    ui_cli.run(_translator(args), show=args.show)
+    return _run_ui(ui_cli.run, _translator(args), show=args.show)
 
 
 def cmd_test(args):
@@ -91,12 +104,12 @@ def cmd_test(args):
                  "[dim](results show in its window, or: journalctl --user -u binharic -f)[/]")
         return
     args.test_mode = True
-    ui_cli.run(_translator(args), show="text", test=True)
+    return _run_ui(ui_cli.run, _translator(args), show="text", test=True)
 
 
 def cmd_tui(args):
     from . import ui_tui
-    ui_tui.run(_translator(args))
+    return _run_ui(ui_tui.run, _translator(args))
 
 
 def cmd_gui(args):
@@ -105,7 +118,7 @@ def cmd_gui(args):
     except ImportError:
         sys.exit("Tk is missing: sudo pacman -S tk   (or use `binharic tui`)")
     from . import ui_gui
-    ui_gui.run(_translator(args))
+    return _run_ui(ui_gui.run, _translator(args))
 
 
 def cmd_pick(args):
@@ -113,9 +126,10 @@ def cmd_pick(args):
     if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
         try:
             import tkinter  # noqa: F401
-            return cmd_gui(args)
         except ImportError:
             pass
+        else:
+            return cmd_gui(args)
     if sys.stdout.isatty():
         return cmd_tui(args)
     return cmd_listen(args)
@@ -250,6 +264,15 @@ def cmd_download(args):
     say_line(f"[green]✔[/] {path}")
 
 
+def _gpu_checks():
+    from . import gpu
+    if not gpu.has_nvidia_driver():
+        return []  # no NVIDIA card: CPU it is, nothing to report
+    return [("NVIDIA GPU visible to Whisper", gpu.cuda_devices() > 0, "check the nvidia driver (nvidia-smi)"),
+            ("CUDA 12 libraries (cuBLAS, cuDNN)", gpu.libs_available(),
+             "rerun ./install.sh  (or run on the CPU: --device cpu)")]
+
+
 def cmd_doctor(args):
     from . import pulse, stt
 
@@ -269,6 +292,7 @@ def cmd_doctor(args):
         ("Binharic Mic", pulse.virtual_mic_exists(), "binharic mic up"),
         ("Whisper (faster-whisper)", stt.have_whisper(), "rerun ./install.sh"),
         ("Vosk", mod("vosk"), "rerun ./install.sh"),
+        *_gpu_checks(),
         ("Tk (for the GUI)", mod("tkinter"), "sudo pacman -S tk"),
         ("rich (pretty CLI)", mod("rich"), "rerun ./install.sh"),
         ("notify-send", bool(shutil.which("notify-send")), "sudo pacman -S libnotify"),
@@ -407,11 +431,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    code = 0
     try:
-        args.func(args)
+        result = args.func(args)
+        if isinstance(result, str):  # a translator front end that stopped on a fatal error
+            say_line(f"[bold red]✖ {result}[/]", f"error: {result}")
+            code = 1
     except RuntimeError as e:
         say_line(f"[bold red]✖[/] {e}", f"error: {e}")
-        sys.exit(1)
+        code = 1
+    except KeyboardInterrupt:
+        code = 130
+    if args.func in (cmd_listen, cmd_tui, cmd_gui, cmd_pick, cmd_test):
+        # audio and Whisper threads live in C libraries; skipping interpreter
+        # teardown avoids crashes on exit after everything was already closed
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

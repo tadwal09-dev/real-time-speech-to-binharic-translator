@@ -42,6 +42,10 @@ def data_dir() -> Path:
     return Path(base) / "binharic"
 
 
+def _short(e: Exception) -> str:
+    return str(e).splitlines()[0][:120] if str(e) else type(e).__name__
+
+
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -74,11 +78,53 @@ class WhisperEngine(Engine):
     def __init__(self, model: str = DEFAULT_WHISPER, device: str = "auto", compute_type: str = "auto",
                  language: str | None = "en", beam_size: int = 5, live_interval: float = 0.8,
                  live_model: str | None = DEFAULT_WHISPER_LIVE):
+        from . import gpu
+
+        if model.endswith(".en"):
+            language = "en"
+        self.language = language
+        self.beam_size = beam_size
+        self.live_interval = live_interval
+        self.prompt = ""
+        self.notice = ""  # something the user should know (e.g. GPU fallback)
+        self._buf: list[np.ndarray] = []
+        self._since = 0
+        self._cost = 0.0  # smoothed seconds per interim pass
+
+        if device == "auto":
+            devices = ["cuda", "cpu"] if gpu.cuda_devices() > 0 else ["cpu"]
+        else:
+            devices = [device]
+        if "cuda" in devices:
+            gpu.preload_cuda_libs()
+        last_error = None
+        for dev in devices:
+            try:
+                self._load(model, live_model, dev, compute_type)
+                break
+            except (RuntimeError, OSError, ValueError) as e:
+                last_error = e
+                if dev == "cuda" and len(devices) > 1:
+                    msg = str(e).lower()
+                    if "driver" in msg:
+                        fix = "update the NVIDIA driver (sudo pacman -Syu) and reboot"
+                    else:
+                        fix = "rerun ./install.sh to install the CUDA 12 libraries"
+                    self.notice = (f"NVIDIA GPU found but it can't be used ({_short(e)}); "
+                                   f"running on the CPU instead. To use the GPU: {fix}.")
+                    continue
+                raise
+        else:  # pragma: no cover - loop always breaks or raises
+            raise last_error
+        self.device = dev
+        name = model if self.fast is self.model else f"{model} + {live_model} live"
+        self.label = f"{name} · {'GPU' if dev == 'cuda' else 'CPU'}"
+
+    def _load(self, model: str, live_model: str | None, device: str, compute_type: str) -> None:
         from faster_whisper import WhisperModel
 
         if compute_type == "auto":
-            compute_type = "int8" if device in ("auto", "cpu") else "float16"
-
+            compute_type = "float16" if device == "cuda" else "int8"
         threads = max(1, min(os.cpu_count() or 4, 16))  # CTranslate2 defaults to 4
 
         def load(name):
@@ -88,17 +134,8 @@ class WhisperEngine(Engine):
         self.model = load(model)
         small = model.split(".")[0] in ("tiny", "base")
         self.fast = self.model if small or not live_model or live_model == model else load(live_model)
-        self.label = model if self.fast is self.model else f"{model} + {live_model} live"
-        self._cost = 0.0  # smoothed seconds per interim pass
-        if model.endswith(".en"):
-            language = "en"
-        self.language = language
-        self.beam_size = beam_size
-        self.live_interval = live_interval
-        self.prompt = ""
-        self._buf: list[np.ndarray] = []
-        self._since = 0
-        # the first inference is several times slower; get it out of the way now
+        # the first inference is several times slower, and on a GPU it is where missing
+        # CUDA libraries show up, so do it now
         warm = np.zeros(STT_SR, dtype=np.float32)
         for m in {id(self.model): self.model, id(self.fast): self.fast}.values():
             list(m.transcribe(warm, language=self.language, beam_size=1, max_new_tokens=4,
