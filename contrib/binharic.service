@@ -1,13 +1,13 @@
-# User service: cp contrib/binharic.service ~/.config/systemd/user/
-#               systemctl --user enable --now binharic
-# Starts OFF; flip it with `binharic toggle` (bind that to a hotkey).
+# Background layer, controlled with hotkeys (`binharic toggle`, `binharic send toggle`).
+#   cp contrib/binharic.service ~/.config/systemd/user/
+#   systemctl --user enable --now binharic
 [Unit]
 Description=Binharic speech layer
 After=pipewire.service pipewire-pulse.service
 
 [Service]
-ExecStartPre=%h/.local/share/binharic/virtual-mic.sh up
-ExecStart=%h/.local/bin/binharic listen --sink binharic_out --passthrough --start-off
+ExecStartPre=%h/.local/bin/binharic mic up
+ExecStart=%h/.local/bin/binharic listen --passthrough --start-off
 Restart=on-failure
 
 [Install]

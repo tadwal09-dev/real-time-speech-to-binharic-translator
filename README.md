@@ -1,18 +1,18 @@
 # real-time-speech-to-binharic-translator
 
-You speak, it listens, and what comes out is **beeps and screeches** instead of your
-voice: real binary, hexadecimal tones, or Adeptus Mechanicus–style binharic scrapcode.
+You talk. Your voice is **muted**, and what comes out instead is **beeps and screeches**:
+real binary, hexadecimal tones, or Adeptus Mechanicus–style binharic scrapcode.
 Anyone with `binharic decode` (and your key, if you set one) hears the actual words.
 Everyone else hears a servitor having a bad day.
 
-Built for **Arch Linux + PipeWire**. It works as a *layer*: it shows up as a virtual
-microphone ("Binharic Mic") you can select in Discord, Mumble, OBS, TeamSpeak, etc.
+Built for **Arch Linux + PipeWire**. It works as a *layer*: a virtual microphone,
+**Binharic Mic**, that you select in Discord, Mumble, OBS, TeamSpeak and so on.
 
 ```
- your mic ──► Vosk (offline speech-to-text) ──► frame + optional key ──► modem ──► Binharic Mic
-                                                                               (beeps / screech)
-
- their speakers / a recording ──► binharic decode ──► "praise the omnissiah"
+ your mic ─► voice detection ─► Whisper (offline) ─► frame + key ─► modem ─► Binharic Mic
+             (mutes your voice)  "after I finish" or                (beeps / screech)
+                                 "as I talk"
+ incoming ─► binharic decode ─► "praise the omnissiah"
 ```
 
 ## Install (Arch)
@@ -22,93 +22,133 @@ git clone <this repo> && cd real-time-speech-to-binharic-translator
 ./install.sh
 ```
 
-That installs `portaudio libpulse python-pipx libnotify` with pacman, installs the
-`binharic` command into `~/.local/bin` with pipx, and downloads the offline English
-speech model (~40 MB, Vosk). Nothing is sent to the cloud.
+The installer does five things:
+- installs `portaudio libpulse tk python-pipx libnotify` with pacman
+- installs the `binharic` command into `~/.local/bin` with pipx
+- downloads the offline Whisper models (`small.en` and `base.en`, about 600 MB)
+- creates the Binharic Mic
+- runs `binharic doctor` to check everything
 
-Manual alternative: `pipx install '.[speech]' && binharic download-model`.
+Nothing you say is sent to the cloud.
 
-## Use it
+## Three ways to run it
 
-```sh
-~/.local/share/binharic/virtual-mic.sh up       # creates the "Binharic Mic" device
-binharic listen --sink binharic_out --passthrough -k "my cant key"
-```
+| Command | What you get |
+|---|---|
+| `binharic gui` | A desktop window with a big ON/OFF button, send-mode and sound switches, key field, speed and pause sliders, a mic meter, a live transcript, history, and a "type to screech" box |
+| `binharic tui` | The same as a full-screen terminal dashboard. Keys: `space` on/off · `l` after-finish ⇄ live · `m` mode · `k` key · `t` type · `p` passthrough · `+/-` speed · `q` quit |
+| `binharic listen` | A plain, colour-coded log. Good for a background service or a tmux pane |
+| `binharic` | Picks for you: the GUI on a desktop, the TUI in a terminal |
 
-Then pick **Binharic Mic** as the input device in your voice app.
+All three take the same options, e.g. `binharic gui -k "my cant key" --live --passthrough`.
+Run `binharic -h` to see them all.
 
-* **ON**: your voice is cut off. Each phrase you finish is transcribed and screeched out.
-* **OFF**: with `--passthrough` your normal voice goes through the same virtual mic,
-  so you never have to change devices. Without it, OFF is silent.
-* `binharic toggle` flips ON/OFF on the running layer and pops up a desktop
-  notification. Bind it to a hotkey (Hyprland: `bind = SUPER, B, exec, binharic toggle`;
-  i3/sway: `bindsym $mod+b exec binharic toggle`; KDE/GNOME: custom shortcut).
-  `binharic off` forces it OFF.
-* Want to hear your own screeching? `pactl load-module module-loopback source=binharic_out.monitor`
+## How it behaves
 
-To run it in the background on every login (starts OFF, with passthrough):
+* **ON**: your real voice never reaches the Binharic Mic. While you talk, it's muted, and
+  the screech is sent instead.
+* **OFF**: nothing is sent. With `--passthrough` (or the GUI checkbox), your normal
+  voice goes through instead, so you never have to switch mics in Discord.
+* **Send mode** (switch it live at any time):
+  * **After I finish** (`phrase`, the default): it waits until you pause (*Pause to
+    send*, 700 ms by default), then screeches the whole sentence. This is the most
+    accurate mode.
+  * **As I talk** (`live`, `--live`): words are screeched while you're still speaking,
+    as soon as the recogniser is sure of them (two passes in a row must agree). It's
+    faster to react but slightly less accurate, because it uses the quicker model for
+    the live words.
 
-```sh
-systemctl --user daemon-reload && systemctl --user enable --now binharic
-```
+### Hotkeys
 
-### Modes
-
-| `--mode`   | What it sounds like | How |
-|------------|---------------------|-----|
-| `binharic` (default) | Mechanicus scrapcode: buzzing, warbling, gliding screeches | 16 tones (one per hex digit) with vibrato, harmonics, buzz and glides between tones |
-| `hex`      | Clean 16-tone R2-D2 beeping | One pure tone per hex digit |
-| `binary`   | Literal ones and zeros | Two tones, low = 0 and high = 1, 8 beeps per letter |
-
-Every transmission starts with a rising sync chirp so the decoder can lock on, and ends
-with a checksum, so garbled audio is thrown away instead of being decoded wrong.
-`--speed 1.5` makes it faster. The listener must use the same `--speed`.
-
-### Keys ("speaking in cant")
-
-With `-k KEY` (or the `BINHARIC_KEY` env var), the text is scrambled before it is turned
-into sound. Anyone who decodes it **without** the key gets
-`[encrypted, N bytes: ...]`. Only people with the same key get the words. Without a key,
-anyone running the decoder can read it. That's still obscure, but it isn't private.
-
-> The key scrambling is a SHA-256 keystream. It keeps people out of casual
-> conversation. It is not audited cryptography, so don't stake anything serious on it.
-
-## Understanding it (the other side)
+Bind these in your WM / DE. Each one also shows a desktop notification.
 
 ```sh
-binharic decode -k "my cant key"                       # listen on the default mic
-binharic decode -k "my cant key" --source <sink>.monitor  # decode what your PC is playing (e.g. Discord)
-binharic decode --wav recording.wav                    # decode a recording
+binharic toggle          # ON/OFF
+binharic send toggle     # after I finish ⇄ as I talk   (or: send live / send phrase)
+binharic on | off | status
 ```
 
-`pactl list short sources` lists the monitor sources. The decoder detects the mode by
-itself. Over the air (speaker to mic) it works best in a quiet room at a decent volume.
-If it misses messages, lower `--threshold`, for example to `0.35`.
+Hyprland: `bind = SUPER, B, exec, binharic toggle` and `bind = SUPER SHIFT, B, exec, binharic send toggle`.
+i3/sway: `bindsym $mod+b exec binharic toggle`.
+
+To run it in the background on every login (it starts OFF, with passthrough), use
+`systemctl --user daemon-reload && systemctl --user enable --now binharic`. Only one
+copy can run at a time; the GUI tells you if the service already holds the mic.
+
+## Speech recognition
+
+The default engine is **Whisper** (via faster-whisper), running locally. It's far more
+accurate than the old Vosk engine and copes with accents and odd words. It uses two models:
+
+* `small.en` for the final, careful pass on each sentence
+* `base.en` for the live words and the running transcript, so it stays real-time on a CPU
+
+| Want | Use |
+|---|---|
+| Faster on a weak CPU | `--model base.en` |
+| Best accuracy on a strong PC | `--model medium.en` |
+| Best accuracy with an NVIDIA GPU | `--model large-v3 --device cuda` |
+| Non-English | `--model small` or `--model large-v3` (multilingual) |
+| Very light, lower accuracy | `--engine vosk` (needs `binharic download-model --engine vosk`) |
+
+For reference, on a 4-core CPU `small.en` takes about 3 s to transcribe 5 s of speech
+and `base.en` takes about 1 s.
+
+## Sound modes
+
+| `--mode` | Sounds like | How |
+|---|---|---|
+| `binharic` (default) | Mechanicus scrapcode: buzzing, warbling, gliding screeches | 16 tones (one per hex digit) with vibrato, harmonics, buzz and glides between tones, about 0.1 s per letter |
+| `hex` | Clean 16-tone R2-D2 beeping | One pure tone per hex digit |
+| `binary` | Literal ones and zeros | A low beep for 0 and a high beep for 1, 8 per letter (slowest) |
+
+Every message starts with a rising sync chirp and ends with a checksum, so garbled
+audio is dropped rather than decoded wrong. `--speed` changes the tempo, and listeners
+must use the same speed.
+
+## Keys ("speaking in cant")
+
+With `-k KEY` (or `BINHARIC_KEY`, or the GUI key field), the text is scrambled before it
+becomes sound. Someone decoding without the key gets `[encrypted, N bytes …]`. Someone
+with it gets the words. Without a key, anyone running the decoder can read it.
+
+> The key scrambling is a SHA-256 keystream. It keeps casual listeners out. It is not
+> audited cryptography.
+
+## The other side: understanding it
+
+```sh
+binharic decode -k KEY                    # listen on the mic
+binharic decode -k KEY --source speakers  # decode whatever your PC is playing (e.g. Discord)
+binharic decode --wav recording.wav
+binharic gui --hear speakers              # see incoming messages decoded inside the GUI/TUI
+```
 
 ## Other commands
 
 ```sh
-binharic say "the flesh is weak"            # screech some typed text
-binharic say -m binary "hi" --wav hi.wav    # save as a WAV instead
-binharic text "Hi"                          # binary: 01001000 01101001 / hex: 48 69
-binharic text -r "01001000 01101001"        # back to text
+binharic say "the flesh is weak"          # screech typed text
+binharic say -m binary "hi" --wav hi.wav  # write a WAV
+binharic text "Hi"                        # binary 01001000 01101001 · hex 48 69
+binharic text -r "01001000 01101001"      # back to text
+binharic mic up | down | status           # manage the Binharic Mic
+binharic devices                          # list sinks, sources and devices
+binharic doctor                           # check the install
+binharic download-model medium.en         # fetch another Whisper model
 ```
 
 ## Notes
 
-* Speech recognition is Vosk's small English model. Bigger and more accurate models
-  are at <https://alphacephei.com/vosk/models>. Use them with
-  `binharic download-model vosk-model-en-us-0.22`. Other languages work the same way.
-* A phrase is sent once you pause, so there is a short delay before the screech.
-  Binary mode is the slowest, at about 0.25 s per letter.
-* By default the layer stops listening while it screeches, so a mic that picks up your
-  speakers can't create a feedback loop. If the output only goes to the virtual mic,
-  `--full-duplex` lets you keep talking over it.
+* The screech goes to the Binharic Mic automatically once it exists (`--sink auto`).
+  Without it, the screech plays on your speakers, and the mic is then ignored while it
+  plays so it can't feed back. To hear yourself as well:
+  `pactl load-module module-loopback source=binharic_out.monitor`.
+* If you speak faster than the screech can play, it queues up and later words are sent
+  in bigger batches. `--speed 1.5` helps.
 
 ## Development
 
 ```sh
-python -m venv .venv && .venv/bin/pip install -e '.[speech,test]'
+python -m venv .venv && .venv/bin/pip install -e '.[all,test]'
 .venv/bin/pytest
 ```

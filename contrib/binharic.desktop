@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Binharic
+Comment=Speak in binary, hex or Mechanicus binharic
+Exec=binharic gui --passthrough
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=speech;binary;voice;warhammer;

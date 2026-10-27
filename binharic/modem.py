@@ -48,8 +48,8 @@ _HEX_TONES = tuple(800.0 + 150.0 * i for i in range(16))
 
 MODES: dict[str, ModeSpec] = {
     "binary": ModeSpec("binary", 0, 1, (1200.0, 2200.0), 0.025, 0.006),
-    "hex": ModeSpec("hex", 1, 4, _HEX_TONES, 0.060, 0.015),
-    "binharic": ModeSpec("binharic", 2, 4, _HEX_TONES, 0.050, 0.020, screech=True),
+    "hex": ModeSpec("hex", 1, 4, _HEX_TONES, 0.045, 0.012),
+    "binharic": ModeSpec("binharic", 2, 4, _HEX_TONES, 0.035, 0.015, screech=True),
 }
 MODES_BY_ID = {m.id: m for m in MODES.values()}
 
