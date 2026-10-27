@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
 
 import numpy as np
@@ -46,12 +47,17 @@ class EnergyVAD:
     before and at onset), ``audio`` chunks while speech continues, and
     ``end`` after ``end_ms`` of quiet. ``pause`` fires after ``pause_ms`` of
     quiet (you *might* be done) and ``resume`` if you carry on, so callers
-    can start work early and throw it away if needed. The threshold follows the background
-    noise floor, so it copes with fans and hum without tuning.
+    can start work early and throw it away if needed.
+
+    The threshold follows the background noise ("minimum statistics": the
+    quietest moment of the last few seconds is the noise floor). Speech always
+    has tiny gaps, so this keeps tracking even mid-sentence, and steady noise
+    such as a fan can never count as one endless sentence.
     """
 
-    def __init__(self, sr: int, frame_ms: int = 20, start_ratio: float = 3.0, min_level: float = 0.006,
-                 start_ms: int = 60, end_ms: int = 700, preroll_ms: int = 300, pause_ms: int = 200):
+    def __init__(self, sr: int, frame_ms: int = 20, start_ratio: float = 3.0, min_level: float = 0.0015,
+                 start_ms: int = 60, end_ms: int = 700, preroll_ms: int = 300, pause_ms: int = 200,
+                 noise_window_ms: int = 3000, calibrate_ms: int = 300):
         self.sr = sr
         self.frame_ms = frame_ms
         self.frame = sr * frame_ms // 1000
@@ -63,6 +69,8 @@ class EnergyVAD:
         self.since_voice = 0  # samples since the last voiced frame
         self.preroll = sr * preroll_ms // 1000
         self.noise = min_level / 2
+        self._recent: collections.deque[float] = collections.deque(maxlen=max(1, noise_window_ms // frame_ms))
+        self._calibrate = max(1, calibrate_ms // frame_ms)  # listen to the room before deciding anything
         self.level = 0.0
         self.speaking = False
         self._above = 0
@@ -82,15 +90,15 @@ class EnergyVAD:
             f, self._pending = self._pending[:self.frame], self._pending[self.frame:]
             rms = float(np.sqrt(np.mean(f * f)) + 1e-9)
             self.level = rms
+            self._recent.append(rms)
+            self.noise = min(self._recent)
             threshold = max(self.min_level, self.noise * self.start_ratio)
             voiced = rms > threshold * 0.5
             self.since_voice = 0 if (voiced and (self.speaking or rms > threshold)) else self.since_voice + len(f)
             if not self.speaking:
-                # noise floor tracks quiet frames quickly, loud ones slowly
-                rate = 0.05 if rms < self.noise * 2 else 0.002
-                self.noise += (rms - self.noise) * rate
                 self._history = np.concatenate([self._history, f])[-self.preroll:]
-                self._above = self._above + 1 if rms > threshold else 0
+                calibrating = len(self._recent) < self._calibrate
+                self._above = self._above + 1 if rms > threshold and not calibrating else 0
                 if self._above >= self.start_frames:
                     self.speaking = True
                     self._below = 0

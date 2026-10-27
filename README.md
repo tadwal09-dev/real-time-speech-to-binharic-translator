@@ -39,7 +39,7 @@ again. `./install.sh --uninstall` removes it.
 | Command | What you get |
 |---|---|
 | `binharic gui` | A desktop window with a big ON/OFF button, send-mode and sound switches, key field, speed and pause sliders, a mic meter, a live transcript, history, and a "type to screech" box |
-| `binharic tui` | The same as a full-screen terminal dashboard. Keys: `space` on/off · `l` after-finish ⇄ live · `m` mode · `k` key · `t` type · `p` passthrough · `+/-` speed · `q` quit |
+| `binharic tui` | The same as a full-screen terminal dashboard. Keys: `space` on/off · `l` after-finish ⇄ live · `x` test mode · `m` mode · `k` key · `t` type · `p` passthrough · `+/-` speed · `q` quit |
 | `binharic listen` | A plain, colour-coded log. Good for a background service or a tmux pane |
 | `binharic` | Picks for you: the GUI on a desktop, the TUI in a terminal |
 
@@ -78,8 +78,23 @@ Nothing goes to the Binharic Mic in test mode. For every phrase it shows:
   ✔ over the air OK: The quick brown fox jumps over the lazy dog…
 ```
 
-You can also switch it on in the GUI (*Test mode* checkbox or Ctrl+T), in the TUI (`x`), or
-on a running layer with `binharic test`, which toggles the service's test mode.
+You can also switch it on in the GUI (*Test mode* checkbox or Ctrl+T) or in the TUI (`x`).
+If binharic is already running (e.g. as the background service), `binharic test` switches
+test mode **on in that one and leaves it on** until you run `binharic test` again, so check
+you've switched it back before you expect your friends to hear you.
+
+## Discord (and other voice apps)
+
+Pick **Binharic Mic** as your input device. Voice apps "clean up" microphone audio, which
+can mangle or even delete a screech, so in Discord's *Voice & Video* settings turn **off**:
+
+* **Noise suppression** (Krisp, or "Standard"): it treats steady tones as noise
+* **Echo cancellation** and **Automatic gain control**
+* "Automatically determine input sensitivity" can stay on, or use push-to-talk (then hold the
+  key while the screech plays)
+
+Mumble, TeamSpeak and OBS have similar noise-suppression options. If your friends'
+`binharic decode` misses messages, that's the first thing to check.
 
 ### Hotkeys
 
@@ -112,7 +127,7 @@ accurate than the old Vosk engine and copes with accents and odd words. It uses 
 | Faster on a weak CPU | `--model base.en` |
 | Best accuracy on a strong PC | `--model medium.en` |
 | Best accuracy with an NVIDIA GPU | `--model large-v3 --device cuda` |
-| Non-English | `--model small` or `--model large-v3` (multilingual) |
+| Non-English | `--model small` or `--model large-v3` (multilingual: it detects the language; `--language de` fixes it) |
 | Very light, lower accuracy | `--engine vosk` (needs `binharic download-model --engine vosk`) |
 
 **NVIDIA GPUs** are used automatically. When `install.sh` sees an NVIDIA driver, it adds
@@ -130,16 +145,16 @@ The screech starts as soon as the recogniser has your sentence. Several things k
 
 * **Speculative final pass**: transcription starts 200 ms into a pause, while it is still
   waiting to see whether you've finished. If you keep talking, that result is thrown away.
-* **Instant start**: the sync chirp is the same for every message, so it plays at once
-  while the rest of the screech is generated (about 90 ms, hidden behind the 180 ms chirp).
-* Low-latency audio buffers, and Whisper uses all your CPU cores.
+* Whisper uses all your CPU cores but one; the spare one keeps the audio glitch-free.
+* The whole screech is generated before it starts playing (50–100 ms) and goes out through
+  a 100 ms buffer, so a busy CPU can't make it drop out mid-message (which would garble it).
 
 Measured on a 4-core CPU, from when you stop talking to the first screech sound:
 
 | Settings | Latency | Accuracy |
 |---|---|---|
 | default (`small.en`) | about 4.0 s | best |
-| `--fast` (`base.en`, greedy, no live transcript) | **about 1.3 s** | very good |
+| `--fast` (`base.en`, greedy, no live transcript) | **about 1.4 s** | very good |
 | `--fast --model tiny.en` | about 0.9 s | poor |
 | any model with `--device cuda` (NVIDIA GPU) | a few hundred ms | same as the model |
 
@@ -156,8 +171,11 @@ rewriting them in C++ wouldn't make it feel any faster. A GPU, or a faster CPU, 
 | `binary` | Literal ones and zeros | A low beep for 0 and a high beep for 1, 8 per letter (slowest) |
 
 Every message starts with a rising sync chirp and ends with a checksum, so garbled
-audio is dropped rather than decoded wrong. `--speed` changes the tempo, and listeners
-must use the same speed.
+audio is dropped rather than decoded wrong. Long text goes out as several messages, each
+with its own chirp. The decoder follows small differences in speed between the two
+computers' sound cards (it decodes fine with the sender's clock 0.3% fast or slow, about
+30 times more than real sound cards differ). `--speed` changes the tempo (0.25–4×), and
+listeners must use the same speed.
 
 ## Keys ("speaking in cant")
 
@@ -180,12 +198,12 @@ binharic gui --hear speakers              # see incoming messages decoded inside
 ## Other commands
 
 ```sh
-binharic say "the flesh is weak"          # screech typed text
+binharic say "the flesh is weak"          # screech typed text (through the running layer, if any)
 binharic say -m binary "hi" --wav hi.wav  # write a WAV
 binharic text "Hi"                        # binary 01001000 01101001 · hex 48 69
 binharic text -r "01001000 01101001"      # back to text
 binharic mic up | down | status           # manage the Binharic Mic
-binharic devices                          # list sinks, sources and devices
+binharic devices                          # list inputs/outputs, and which ones binharic uses
 binharic doctor                           # check the install
 binharic download-model medium.en         # fetch another Whisper model
 ```
@@ -198,6 +216,10 @@ binharic download-model medium.en         # fetch another Whisper model
   `pactl load-module module-loopback source=binharic_out.monitor`.
 * If you speak faster than the screech can play, it queues up and later words are sent
   in bigger batches. `--speed 1.5` helps.
+* If PipeWire restarts (an update, suspend/resume), binharic reconnects by itself and
+  re-creates the Binharic Mic. Your voice app may need you to re-select it.
+* `systemctl --user stop binharic`, closing the terminal, or Ctrl+C all shut it down
+  cleanly.
 
 ## Development
 

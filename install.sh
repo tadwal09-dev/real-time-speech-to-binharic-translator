@@ -64,7 +64,8 @@ ln -sf "$VENV/bin/binharic" "$BIN"
 step "desktop entry and background service"
 mkdir -p ~/.config/systemd/user ~/.local/share/applications
 install -m644 contrib/binharic.service ~/.config/systemd/user/binharic.service
-install -m644 contrib/binharic.desktop ~/.local/share/applications/binharic.desktop
+# app launchers often don't have ~/.local/bin on their PATH: use the full path
+sed "s|^Exec=binharic |Exec=$BIN |" contrib/binharic.desktop > ~/.local/share/applications/binharic.desktop
 systemctl --user daemon-reload 2>/dev/null || true
 
 step "downloading speech models ($ENGINE)"

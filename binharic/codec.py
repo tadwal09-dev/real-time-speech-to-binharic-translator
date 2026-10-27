@@ -128,6 +128,35 @@ def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None)
     return Message(payload.decode("utf-8", errors="replace"), frame_mode, encrypted, raw=payload), total
 
 
+CHUNK_BYTES = 240  # per frame: each frame has its own sync chirp, so long text re-syncs often
+
+
+def split_text(text: str, max_bytes: int = CHUNK_BYTES) -> list[str]:
+    """Split text into pieces of at most ``max_bytes`` UTF-8 bytes, at spaces
+    where possible and never inside a character."""
+    chunks: list[str] = []
+    cur = ""
+    for word in text.split():
+        while len(word.encode("utf-8")) > max_bytes:  # a monster word: cut it at a character boundary
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            cut = max_bytes
+            while len(word[:cut].encode("utf-8")) > max_bytes:
+                cut -= 1
+            chunks.append(word[:cut])
+            word = word[cut:]
+        candidate = f"{cur} {word}" if cur else word
+        if len(candidate.encode("utf-8")) > max_bytes:
+            chunks.append(cur)
+            cur = word
+        else:
+            cur = candidate
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def to_binary(text: str) -> str:
     return " ".join(f"{b:08b}" for b in text.encode("utf-8"))
 
@@ -138,8 +167,13 @@ def to_hex(text: str) -> str:
 
 def from_binary(s: str) -> str:
     bits = "".join(c for c in s if c in "01")
-    return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits) - len(bits) % 8, 8)).decode("utf-8", "replace")
+    if len(bits) % 8:
+        raise ValueError(f"{len(bits)} bits isn't a whole number of bytes (8 bits each)")
+    return bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)).decode("utf-8", "replace")
 
 
 def from_hex(s: str) -> str:
-    return bytes.fromhex("".join(c for c in s if c in "0123456789abcdefABCDEF")).decode("utf-8", "replace")
+    digits = "".join(c for c in s if c in "0123456789abcdefABCDEF")
+    if len(digits) % 2:
+        raise ValueError(f"{len(digits)} hex digits isn't a whole number of bytes (2 digits each)")
+    return bytes.fromhex(digits).decode("utf-8", "replace")

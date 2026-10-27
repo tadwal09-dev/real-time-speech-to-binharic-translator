@@ -44,12 +44,24 @@ def virtual_mic_exists() -> bool:
 
 
 def mic_up() -> None:
+    before_sink, before_source = _default("sink"), _default("source")
     if SINK not in sinks():
         _pactl("load-module", "module-null-sink", f"sink_name={SINK}",
                "sink_properties=device.description=Binharic_Output")
     if MIC not in sources():
         _pactl("load-module", "module-remap-source", f"master={SINK}.monitor", f"source_name={MIC}",
                "source_properties=device.description=Binharic_Mic")
+    # PipeWire can make a brand-new device the default. Then all your other
+    # sound would vanish into the virtual sink (or apps would record from the
+    # Binharic Mic): put the previous defaults back.
+    try:
+        if before_sink and before_sink != SINK and _default("sink") == SINK:
+            _pactl("set-default-sink", before_sink)
+        if before_source and before_source not in (MIC, f"{SINK}.monitor") and \
+                _default("source") in (MIC, f"{SINK}.monitor"):
+            _pactl("set-default-source", before_source)
+    except (RuntimeError, subprocess.CalledProcessError, OSError):
+        pass
 
 
 def mic_down() -> int:
@@ -61,13 +73,11 @@ def mic_down() -> int:
     return n
 
 
-def default_sink_monitor() -> str | None:
-    """Monitor of the speakers: decode what Discord etc. is playing to you."""
-    try:
-        name = _pactl("get-default-sink").strip()
-    except (RuntimeError, subprocess.CalledProcessError, OSError):
-        return None
-    return f"{name}.monitor" if name else None
+def speakers_monitor() -> str | None:
+    """Monitor of your real speakers: decode what Discord etc. plays to you.
+    (Never the virtual sink's monitor, which is just our own screech.)"""
+    sink = real_sink()
+    return f"{sink}.monitor" if sink else None
 
 
 def resolve_sink(value: str | None) -> str | None:
@@ -81,8 +91,21 @@ def resolve_sink(value: str | None) -> str | None:
 
 def resolve_source(value: str | None) -> str | None:
     if value in ("speakers", "monitor"):
-        return default_sink_monitor()
+        return speakers_monitor()
     return value or None
+
+
+def check_device(name: str, kind: str) -> None:
+    """Raise a helpful error if a sink/source name doesn't exist."""
+    try:
+        names = sinks() if kind == "sinks" else sources()
+    except (RuntimeError, subprocess.CalledProcessError, OSError):
+        return  # can't tell; pacat/parec will report it
+    if name not in names:
+        what = "output (sink)" if kind == "sinks" else "input (source)"
+        listing = ", ".join(names) or "none"
+        raise RuntimeError(f"there is no {what} called '{name}'. Available: {listing}. "
+                           "See `binharic devices`.")
 
 
 def _info(kind: str) -> list[dict]:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import queue
 import time
 
-from . import modem
 from .core import Translator
 from .stt import LIVE, PHRASE
 
@@ -13,15 +12,17 @@ BG, PANEL, FG, DIM = "#121012", "#1d191c", "#e8dcd0", "#8a7f78"
 RED, RED_HI, GREEN, AMBER = "#b3121b", "#e0252f", "#3fbf6f", "#e0a526"
 FONT = ("Inter", 10)
 MONO = ("JetBrains Mono", 10)
+LOG_LINES = 2000
 
 
 def run(tr: Translator) -> None:
     tr.s.notify = False  # the window already shows every change
     import tkinter as tk
     from tkinter import font as tkfont
-    from tkinter import ttk
+    from tkinter import messagebox, ttk
 
     root = tk.Tk()
+    root.withdraw()  # stay hidden until we know we can start (else only an error dialog shows)
     root.title("Binharic")
     root.configure(bg=BG)
     root.minsize(560, 560)
@@ -99,20 +100,24 @@ def run(tr: Translator) -> None:
         holder.grid(row=row, column=1, sticky="w")
         shown = tk.Label(holder, bg=PANEL, fg=FG, font=ui, width=8, anchor="w")
 
+        building = True  # ttk.Scale calls its command on set(): don't touch the settings while building
+
         def moved(v):
             v = round(float(v) / step) * step
             shown.configure(text=fmt(v))
-            command(v)
+            if not building:
+                command(v)
 
         sc = ttk.Scale(holder, from_=frm, to=to, orient="horizontal", length=260,
                        style="B.Horizontal.TScale", command=moved)
         sc.set(value)
         sc.pack(side="left")
         shown.pack(side="left", padx=10)
-        moved(value)
+        shown.configure(text=fmt(value))  # show the real value, unrounded
+        building = False
 
     slider(3, "Speed", 0.5, 3.0, 0.25, tr.s.speed, lambda v: f"{v:.2f}×", tr.set_speed)
-    slider(4, "Pause to send", 300, 2000, 100, tr.s.end_ms, lambda v: f"{int(v)} ms",
+    slider(4, "Pause to send", 300, 2000, 50, tr.s.end_ms, lambda v: f"{int(v)} ms",
            lambda v: tr.set_end_ms(int(v)))
 
     pass_var = tk.BooleanVar(value=tr.s.passthrough)
@@ -158,6 +163,9 @@ def run(tr: Translator) -> None:
         log.insert("end", mark + text + "\n", kind)
         if extra:
             log.insert("end", "          " + extra + "\n", "hex")
+        lines = int(log.index("end-1c").split(".")[0])
+        if lines > LOG_LINES:  # a long session must not grow the window's memory forever
+            log.delete("1.0", f"{lines - LOG_LINES}.0")
         log.configure(state="disabled")
         log.see("end")
 
@@ -185,6 +193,12 @@ def run(tr: Translator) -> None:
     def typing():
         return root.focus_get() in (key_entry, say_entry)
 
+    def click(event):
+        # clicking anywhere but a text box leaves it, so Space toggles again
+        if event.widget not in (key_entry, say_entry):
+            root.focus_set()
+
+    root.bind_all("<Button-1>", click, add="+")
     root.bind("<space>", lambda e: None if typing() else tr.toggle())
     root.bind("<Control-l>", lambda e: tr.set_send_mode("toggle"))
     root.bind("<Control-t>", lambda e: tr.set_test(not tr.s.test))
@@ -239,7 +253,9 @@ def run(tr: Translator) -> None:
         lvl = min(1.0, (state["level"] * 12) ** 0.6)
         meter.delete("all")
         meter.create_rectangle(0, 0, int(w * lvl), 14, fill=GREEN if tr.speaking else "#4a6b78", width=0)
-        if tr.s.test and not tr.screeching.is_set():
+        if not tr.ready and not tr.stopped:
+            status_lbl.configure(text="loading the speech model…", fg=DIM)
+        elif tr.s.test and not tr.screeching.is_set():
             status_lbl.configure(text="TEST MODE · say something" + (" · listening…" if tr.speaking else ""),
                                  fg=AMBER)
         elif not tr.s.enabled:
@@ -252,6 +268,8 @@ def run(tr: Translator) -> None:
         else:
             status_lbl.configure(text="voice muted · waiting for you to speak", fg=DIM)
         if tr.stopped:
+            if tr.fatal:  # don't just vanish: say what went wrong
+                messagebox.showerror("Binharic stopped", tr.fatal, parent=root)
             root.destroy()
             return
         root.after(40, poll)
@@ -262,7 +280,13 @@ def run(tr: Translator) -> None:
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh()
-    tr.start()
+    try:
+        tr.start()
+    except Exception as e:  # e.g. already running, a missing device: show it, launched from a menu
+        messagebox.showerror("Binharic can't start", str(e), parent=root)
+        root.destroy()
+        raise
+    root.deiconify()
     root.after(40, poll)
     try:
         root.mainloop()

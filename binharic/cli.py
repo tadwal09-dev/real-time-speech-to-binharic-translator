@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import sys
 
 import numpy as np
@@ -24,10 +25,18 @@ SR = modem.DEFAULT_SR
 
 try:
     from rich.console import Console
-    from rich.table import Table
+    from rich.markup import escape as _rich_escape
     console = Console(highlight=False)
 except ImportError:
-    console = Table = None
+    console = None
+
+    def _rich_escape(text: str) -> str:
+        return text
+
+
+def esc(text: object) -> str:
+    """Make arbitrary text (decoded messages, device names, paths) safe inside rich markup."""
+    return _rich_escape(str(text))
 
 
 def say_line(markup: str, plain: str | None = None) -> None:
@@ -35,6 +44,25 @@ def say_line(markup: str, plain: str | None = None) -> None:
         console.print(markup)
     else:
         print(plain if plain is not None else markup)
+
+
+# argument checks: a bad value gets a one-line error, not a traceback
+def _ranged(kind, lo: float, hi: float, what: str):
+    def check(value: str):
+        try:
+            v = kind(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} isn't a number") from None
+        if not lo <= v <= hi:
+            raise argparse.ArgumentTypeError(f"{what} must be between {lo:g} and {hi:g}")
+        return v
+    return check
+
+
+SPEED = _ranged(float, 0.25, 4.0, "speed")
+VOLUME = _ranged(float, 0.01, 1.0, "volume")
+PAUSE = _ranged(int, 100, 5000, "pause (ms)")
+THRESHOLD = _ranged(float, 0.05, 0.95, "threshold")
 
 
 def _key(value: str | None) -> str | None:
@@ -47,20 +75,21 @@ def _key(value: str | None) -> str | None:
 def _settings(args):
     from . import pulse
     from .core import Settings
-    from .stt import LIVE, PHRASE
+    from .stt import LIVE, PHRASE, resolve_engine
 
     sink = pulse.resolve_sink(args.sink)
     model, live_model, beam, pause, partials = args.model, args.live_model, 5, args.pause_ms, True
     if args.fast:
         # one quick model, greedy decoding, shorter pause, no interim transcripts
-        model, live_model, beam, partials = model or "base.en", None, 1, False
-        pause = min(pause, 450)
+        beam, partials, pause = 1, False, min(pause, 450)
+        if resolve_engine(args.engine) == "whisper":
+            model, live_model = model or ("base.en" if not args.language else "base"), None
     return Settings(
         enabled=not args.start_off,
         send_mode=LIVE if args.live else PHRASE,
         mode=args.mode, key=_key(args.key), speed=args.speed, volume=args.volume,
         passthrough=args.passthrough, engine=args.engine, model=model, live_model=live_model,
-        device=args.device, beam=beam, partials=partials, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
+        device=args.device, beam=beam, partials=partials, language=args.language, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
         sink=sink, source=pulse.resolve_source(args.source),
         output_device=args.output_device, input_device=args.input_device,
         duplex=args.duplex, end_ms=pause,
@@ -74,6 +103,10 @@ def _translator(args):
 
 
 def _run_ui(run, tr, **kw):
+    # `systemctl --user stop`, closing the terminal, `kill`: shut down cleanly
+    # (close the audio, remove the control socket) instead of just dying
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: tr.request_stop())
     try:
         run(tr, **kw)
     except KeyboardInterrupt:
@@ -88,7 +121,7 @@ def _run_ui(run, tr, **kw):
 
 def cmd_listen(args):
     from . import ui_cli
-    return _run_ui(ui_cli.run, _translator(args), show=args.show)
+    return _run_ui(ui_cli.run, _translator(args), show=getattr(args, "show", "text"))
 
 
 def cmd_test(args):
@@ -99,9 +132,13 @@ def cmd_test(args):
     except RuntimeError:
         pass  # nothing running: start our own test session below
     else:
-        state = "ON" if reply["test"] else "OFF"
-        say_line(f"[yellow]⚙ test mode {state} in the binharic that's already running[/] "
-                 "[dim](results show in its window, or: journalctl --user -u binharic -f)[/]")
+        if reply["test"]:
+            say_line("[yellow]⚙ binharic is already running, so test mode is now ON in that one:[/] its screech "
+                     "plays on your speakers instead of the Binharic Mic. Results show in its window "
+                     "(or: journalctl --user -u binharic -f).\n  [bold]Run `binharic test` again to switch it "
+                     "back[/] to the Binharic Mic.")
+        else:
+            say_line("[green]⚙ test mode OFF[/] in the running binharic: the screech goes to the Binharic Mic again.")
         return
     args.test_mode = True
     return _run_ui(ui_cli.run, _translator(args), show="text", test=True)
@@ -162,15 +199,33 @@ def cmd_ctl(args):
 
 def cmd_say(args):
     from . import pulse
-    text = " ".join(args.text) if args.text else sys.stdin.read().strip()
+    text = " ".join(args.text) if args.text else ("" if sys.stdin.isatty() else sys.stdin.read())
+    text = " ".join(text.split())
+    if not text:
+        sys.exit("nothing to say: binharic say \"your message\"  (or pipe text in)")
+    if not args.wav and not args.direct:
+        # a running layer owns the Binharic Mic: queue it there rather than
+        # playing a second stream over (and garbling) whatever it's sending
+        from .core import send_command
+        try:
+            send_command("say " + text)
+        except RuntimeError:
+            pass
+        else:
+            say_line("[green]⚙ queued in the running binharic[/] [dim](its mode, key and speed apply; "
+                     "--direct plays it yourself)[/]")
+            return
     audio = modem.encode_text(text, args.mode, key=_key(args.key), sr=SR, speed=args.speed, volume=args.volume)
     if args.wav:
         from .audio import write_wav
         write_wav(args.wav, audio, SR)
-        say_line(f"[green]wrote[/] {args.wav} [dim]({len(audio) / SR:.1f}s)[/]")
+        say_line(f"[green]wrote[/] {esc(args.wav)} [dim]({len(audio) / SR:.1f}s)[/]")
         return
     from .audio import Output
-    out = Output(SR, sink=pulse.resolve_sink(args.sink), device=args.output_device)
+    sink = pulse.resolve_sink(args.sink)
+    if sink is None and not args.output_device and pulse.available():
+        sink = pulse.real_sink()  # PipeWire directly: PortAudio over ALSA is unreliable there
+    out = Output(SR, sink=sink, device=args.output_device)
     try:
         out.write(audio)
         out.write(np.zeros(SR // 4, dtype=np.float32))
@@ -194,27 +249,42 @@ def cmd_decode(args):
 
     from .audio import Input
     source = pulse.resolve_source(args.source)
+    if source is None and not args.input_device and pulse.available():
+        source = pulse.real_source()
+    elif source:
+        pulse.check_device(source, "sources")
     mic = Input(SR, source=source, device=args.input_device)
     dec = modem.StreamDecoder(SR, args.mode, key=key, speed=args.speed, threshold=args.threshold)
-    say_line(f"[cyan]⚙ listening for binharic on {source or 'the default mic'}… (Ctrl+C stops)[/]")
+    where = pulse.describe(source, "sources") if source else "the default mic"
+    say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
+
+    def show(m):
+        tag = modem.MODES_BY_ID[m.mode_id].name if m.mode_id in modem.MODES_BY_ID else "?"
+        style = "yellow" if m.locked else "bold green"
+        # decoded text is whatever someone sent: never let it be read as markup
+        say_line(f"[{style}]▼ {esc('[' + tag + ']')} {esc(m.display())}[/]", f"<< [{tag}] {m.display()}")
+
     try:
         while True:
             for m in dec.feed(mic.read()):
-                tag = modem.MODES_BY_ID[m.mode_id].name if m.mode_id in modem.MODES_BY_ID else "?"
-                style = "yellow" if m.locked else "bold green"
-                say_line(f"[{style}]▼ [{tag}] {m.display()}[/]", f"<< [{tag}] {m.display()}")
+                show(m)
     except (KeyboardInterrupt, EOFError):
         for m in dec.flush():
-            print(m.display())
+            show(m)
     finally:
         mic.close()
 
 
 def cmd_text(args):
-    text = " ".join(args.text) if args.text else sys.stdin.read().strip()
+    text = " ".join(args.text) if args.text else ("" if sys.stdin.isatty() else sys.stdin.read().strip())
+    if not text:
+        sys.exit("nothing to convert: binharic text \"your message\"  (or -r \"01001000 ...\")")
     if args.reverse:
         t = text.strip()
-        print(codec.from_binary(t) if set(t) <= set("01 \n\t") else codec.from_hex(t))
+        try:
+            print(codec.from_binary(t) if set(t) <= set("01 \n\t") else codec.from_hex(t))
+        except ValueError as e:
+            sys.exit(f"can't read that: {e}")
         return
     say_line(f"[dim]binary[/] {codec.to_binary(text)}", f"binary: {codec.to_binary(text)}")
     say_line(f"[dim]hex   [/] {codec.to_hex(text)}", f"hex:    {codec.to_hex(text)}")
@@ -239,19 +309,24 @@ def cmd_mic(args):
 def cmd_devices(args):
     from . import pulse
     if pulse.available():
-        say_line("[bold]PipeWire/Pulse sinks[/] [dim](--sink)[/]")
-        for n in pulse.sinks():
-            say_line(f"  {n}")
-        say_line("[bold]PipeWire/Pulse sources[/] [dim](--source, --hear; 'speakers' = what you hear)[/]")
-        for n in pulse.sources():
-            say_line(f"  {n}")
+        mic, spk = pulse.real_source(), pulse.real_sink()
+        for kind, title, mine in (("sinks", "Outputs (--sink)", spk),
+                                  ("sources", "Inputs (--source, --hear; 'speakers' = what you hear)", mic)):
+            say_line(f"[bold]{title}[/]")
+            for d in pulse._info(kind):
+                star = " [green]← binharic uses this[/]" if d["name"] == mine else ""
+                say_line(f"  {esc(d['name'])}  [dim]{esc(d['description'])}[/]{star}",
+                         f"  {d['name']}  ({d['description']})")
     try:
         import sounddevice as sd
         say_line("[bold]PortAudio devices[/] [dim](--input-device / --output-device)[/]")
         for i, d in enumerate(sd.query_devices()):
             say_line(f"  {i:>2} {d['name']}  [dim]in {d['max_input_channels']} / out {d['max_output_channels']}[/]")
     except Exception as e:
-        say_line(f"[yellow]PortAudio unavailable: {e}[/]")
+        if pulse.available():
+            say_line("[dim]PortAudio isn't installed - not needed, binharic talks to PipeWire directly[/]")
+        else:
+            say_line(f"[yellow]PortAudio unavailable: {esc(e)}[/]")
 
 
 def cmd_download(args):
@@ -301,12 +376,15 @@ def cmd_doctor(args):
         except Exception:
             return False
 
+    have_pulse = pulse.available()
     checks = [
         ("numpy", mod("numpy"), "rerun ./install.sh"),
-        ("sounddevice / PortAudio", mod("sounddevice"), "sudo pacman -S portaudio"),
+        # only a fallback when PipeWire/Pulse is running
+        ("sounddevice / PortAudio" + (" (optional with PipeWire)" if have_pulse else ""),
+         mod("sounddevice") or None if have_pulse else mod("sounddevice"), "sudo pacman -S portaudio"),
         ("pactl / pacat (PipeWire)", bool(shutil.which("pactl") and shutil.which("pacat")),
          "sudo pacman -S libpulse pipewire-pulse"),
-        ("PipeWire/Pulse server", pulse.available(), "systemctl --user start pipewire-pulse"),
+        ("PipeWire/Pulse server", have_pulse, "systemctl --user start pipewire-pulse"),
         ("Binharic Mic", pulse.virtual_mic_exists(), "binharic mic up"),
         ("Whisper (faster-whisper)", stt.have_whisper(), "rerun ./install.sh"),
         ("Vosk", mod("vosk"), "rerun ./install.sh"),
@@ -317,7 +395,10 @@ def cmd_doctor(args):
     ]
     checks += _audio_checks()
     for name, ok, fix in checks:
-        say_line(f"  {'[green]✔[/]' if ok else '[red]✖[/]'} {name}" + ("" if ok else f"  [dim]→ {fix}[/]"),
+        if ok is None:  # optional and missing: not a problem
+            say_line(f"  [dim]–[/] {esc(name)}  [dim](not installed; fine)[/]", f"  --  {name} (not installed; fine)")
+            continue
+        say_line(f"  {'[green]✔[/]' if ok else '[red]✖[/]'} {esc(name)}" + ("" if ok else f"  [dim]→ {esc(fix)}[/]"),
                  f"  {'ok ' if ok else 'MISSING'} {name}" + ("" if ok else f"  -> {fix}"))
 
 
@@ -344,12 +425,12 @@ def _run_options(p, inherit: bool = False):
     g.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic",
                    help="binharic = Mechanicus screech, hex = 16 tones, binary = 0/1 beeps")
     g.add_argument("-k", "--key", help="shared cant-key; only holders can read you (or set BINHARIC_KEY)")
-    g.add_argument("--speed", type=float, default=1.0, help="tempo multiplier, listeners must match")
-    g.add_argument("--volume", type=float, default=0.6)
+    g.add_argument("--speed", type=SPEED, default=1.0, help="tempo multiplier 0.25-4, listeners must match")
+    g.add_argument("--volume", type=VOLUME, default=0.6, help="0.01-1")
 
     g = p.add_argument_group("sending")
     g.add_argument("--live", action="store_true", help="screech words as you say them (default: after you finish)")
-    g.add_argument("--pause-ms", type=int, default=700, help="silence that counts as 'finished' (ms)")
+    g.add_argument("--pause-ms", type=PAUSE, default=700, help="silence that counts as 'finished' (ms)")
     g.add_argument("--start-off", action="store_true", help="start in the OFF state")
     g.add_argument("--passthrough", action="store_true", help="while OFF, send your normal voice")
 
@@ -359,6 +440,8 @@ def _run_options(p, inherit: bool = False):
     g.add_argument("--model", help="whisper size (tiny.en base.en small.en medium.en large-v3) or vosk model dir")
     g.add_argument("--live-model", default="base.en",
                    help="faster whisper model for live words / interim text (default base.en)")
+    g.add_argument("--language", help="language for multilingual whisper models, e.g. de, fr, ja "
+                                      "(default: detect; .en models are English)")
     g.add_argument("--device", default="auto", help="whisper compute device: auto, cpu, cuda")
     g.add_argument("--fast", action="store_true",
                    help="lowest latency: base.en only, greedy decoding, 450 ms pause, no live transcript")
@@ -408,25 +491,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("when", nargs="?", choices=["toggle", "live", "phrase"], default="toggle")
     s.set_defaults(func=lambda a: _control(f"send {a.when}"))
 
-    s = sub.add_parser("say", help="screech typed text (or write a WAV)")
+    s = sub.add_parser("say", help="screech typed text: through the running layer if there is one, "
+                                   "else into the Binharic Mic (or your speakers), or to a WAV")
     s.add_argument("text", nargs="*")
     s.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic")
     s.add_argument("-k", "--key")
-    s.add_argument("--speed", type=float, default=1.0)
-    s.add_argument("--volume", type=float, default=0.6)
+    s.add_argument("--speed", type=SPEED, default=1.0)
+    s.add_argument("--volume", type=VOLUME, default=0.6)
     s.add_argument("--wav", help="write to this WAV file instead of playing")
-    s.add_argument("--sink", default="auto")
+    s.add_argument("--direct", action="store_true", help="play it yourself even if a layer is running")
+    s.add_argument("--sink", default="auto", help="auto (Binharic Mic if set up), default (your speakers) or a name")
     s.add_argument("--output-device")
     s.set_defaults(func=cmd_say)
 
     s = sub.add_parser("decode", help="translate binharic back to text (mic, source or WAV)")
     s.add_argument("-m", "--mode", choices=["auto"] + list(modem.MODES), default="auto")
     s.add_argument("-k", "--key")
-    s.add_argument("--speed", type=float, default=1.0)
+    s.add_argument("--speed", type=SPEED, default=1.0)
     s.add_argument("--wav")
     s.add_argument("--source", help="PipeWire source; 'speakers' decodes what your PC is playing")
     s.add_argument("--input-device")
-    s.add_argument("--threshold", type=float, default=0.45, help="sync-chirp detection threshold (0-1)")
+    s.add_argument("--threshold", type=THRESHOLD, default=0.45, help="sync-chirp detection threshold (0.05-0.95)")
     s.set_defaults(func=cmd_decode)
 
     s = sub.add_parser("text", help="show text as binary/hex, or --reverse to read it back")
@@ -454,10 +539,10 @@ def main(argv=None):
     try:
         result = args.func(args)
         if isinstance(result, str):  # a translator front end that stopped on a fatal error
-            say_line(f"[bold red]✖ {result}[/]", f"error: {result}")
+            say_line(f"[bold red]✖ {esc(result)}[/]", f"error: {result}")
             code = 1
-    except RuntimeError as e:
-        say_line(f"[bold red]✖[/] {e}", f"error: {e}")
+    except (RuntimeError, OSError) as e:
+        say_line(f"[bold red]✖[/] {esc(e)}", f"error: {e}")
         code = 1
     except KeyboardInterrupt:
         code = 130

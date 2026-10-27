@@ -101,46 +101,57 @@ def _fade(n: int, ramp: int) -> np.ndarray:
     return env
 
 
+def _grid(spec: ModeSpec, sr: int, count: int) -> np.ndarray:
+    """Symbol boundaries in samples, on an exact time grid (k * step seconds,
+    rounded once). Sender and receiver share it, so they agree at any sample
+    rate and speed - no rounding drift over long messages."""
+    return np.round(np.arange(count + 1) * (spec.symbol + spec.guard) * sr).astype(np.int64)
+
+
+def _steady(spec: ModeSpec, sr: int) -> int:
+    return int(round(spec.symbol * sr))
+
+
 def _beeps(symbols: list[int], spec: ModeSpec, sr: int) -> np.ndarray:
-    n_sym, n_guard = int(spec.symbol * sr), int(spec.guard * sr)
+    if not symbols:
+        return np.zeros(0)
+    b = _grid(spec, sr, len(symbols))
+    n_sym = _steady(spec, sr)
     t = np.arange(n_sym) / sr
     env = _fade(n_sym, int(0.004 * sr))
-    gap = np.zeros(n_guard)
-    parts = []
-    for s in symbols:
-        parts.append(np.sin(2 * np.pi * spec.tones[s] * t) * env)
-        parts.append(gap)
-    return np.concatenate(parts) if parts else np.zeros(0)
+    out = np.zeros(b[-1])
+    for k, sym in enumerate(symbols):  # tone first, then the gap
+        out[b[k]:b[k] + n_sym] = np.sin(2 * np.pi * spec.tones[sym] * t) * env
+    return out
 
 
 def _screech(symbols: list[int], spec: ModeSpec, sr: int, rng: np.random.Generator) -> np.ndarray:
-    n_sym, n_guard = int(spec.symbol * sr), int(spec.guard * sr)
     if not symbols:
         return np.zeros(0)
-    freqs = []
-    prev = spec.tones[symbols[0]]
+    b = _grid(spec, sr, len(symbols))
+    n_sym = _steady(spec, sr)
+    freq = np.empty(b[-1])
+    env = np.empty(b[-1])
+    steady_env = _fade(n_sym, int(0.003 * sr)) * 0.45 + 0.55
     t_sym = np.arange(n_sym) / sr
-    for s in symbols:
-        f = spec.tones[s]
-        # glide from the previous tone into this one (the "scrape")
-        g = np.linspace(0, 1, n_guard) ** 0.5
-        freqs.append(prev + (f - prev) * g)
-        # warble around the steady tone
+    prev = spec.tones[symbols[0]]
+    for k, sym in enumerate(symbols):  # glide first (the "scrape"), then the warbling tone
+        f = spec.tones[sym]
+        n_guard = b[k + 1] - b[k] - n_sym
+        g0, g1 = b[k], b[k] + n_guard
+        freq[g0:g1] = prev + (f - prev) * np.linspace(0, 1, n_guard) ** 0.5
+        env[g0:g1] = 0.55  # dip the level during glides so the steady part dominates
         rate = rng.uniform(18, 32)
-        freqs.append(f + 14.0 * np.sin(2 * np.pi * rate * t_sym + rng.uniform(0, 2 * np.pi)))
+        freq[g1:b[k + 1]] = f + 14.0 * np.sin(2 * np.pi * rate * t_sym + rng.uniform(0, 2 * np.pi))
+        env[g1:b[k + 1]] = steady_env
         prev = f
-    freq = np.concatenate(freqs)
     phase = 2 * np.pi * np.cumsum(freq) / sr
     sig = np.sin(phase) + 0.30 * np.sin(2 * phase) + 0.12 * np.sin(3 * phase + 0.7)
     # buzzy amplitude modulation + a little grit
     t = np.arange(len(sig)) / sr
     sig *= 1.0 + 0.45 * np.sign(np.sin(2 * np.pi * 67 * t)) * 0.5
     sig += 0.05 * rng.standard_normal(len(sig))
-    sig = np.tanh(1.4 * sig)
-    # dip the level during glides so the steady part dominates
-    env = np.concatenate([np.concatenate([np.full(n_guard, 0.55), _fade(n_sym, int(0.003 * sr)) * 0.45 + 0.55])
-                          for _ in symbols])
-    return sig * env
+    return np.tanh(1.4 * sig) * env
 
 
 _LEAD_IN: dict[int, np.ndarray] = {}
@@ -173,8 +184,11 @@ def modulate(frame: bytes, spec: ModeSpec, sr: int = DEFAULT_SR, volume: float =
 
 def encode_text(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,
                 speed: float = 1.0, volume: float = 0.8) -> np.ndarray:
+    """Text -> audio. Long text becomes several frames back to back (each
+    with its own sync chirp), so nothing is ever cut off."""
     spec = get_mode(mode, speed)
-    return modulate(codec.build_frame(text, spec.id, key), spec, sr, volume)
+    chunks = codec.split_text(text) or [""]
+    return np.concatenate([modulate(codec.build_frame(c, spec.id, key), spec, sr, volume) for c in chunks])
 
 
 def encode_body(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,
@@ -219,28 +233,65 @@ def find_preambles(sig: np.ndarray, sr: int, threshold: float = 0.45) -> list[in
     return sorted(kept)
 
 
-def _demod_symbols(sig: np.ndarray, sr: int, start: int, spec: ModeSpec, first: int, count: int) -> list[int]:
-    n_sym, n_guard = int(spec.symbol * sr), int(spec.guard * sr)
-    step = n_sym + n_guard
-    margin = int(n_sym * 0.15)
-    win_len = n_sym - 2 * margin
-    sym_off = n_guard if spec.screech else 0  # screech puts the glide before each tone
-    window = np.hanning(win_len)
-    t = np.arange(win_len) / sr
-    basis = np.exp(-2j * np.pi * np.outer(np.asarray(spec.tones), t))  # (tones, win)
-    out = []
-    for k in range(first, first + count):
-        s = start + k * step + sym_off + margin
-        seg = sig[s:s + win_len]
-        energies = np.abs(basis @ (seg * window))
-        out.append(int(np.argmax(energies)))
-    return out
+class _Demod:
+    """Reads symbols one after another, following the sender's clock.
 
+    Two sound cards never run at exactly the same rate, and over a long
+    message the difference adds up to more than the slack in each symbol.
+    After deciding each tone we compare its energy a little early and a
+    little late (an early/late gate) and nudge the timing towards the
+    stronger side, so the decoder tracks the drift instead of falling off it.
+    """
 
-def _symbols_available(n_samples: int, sr: int, start: int, spec: ModeSpec) -> int:
-    n_sym, n_guard = int(spec.symbol * sr), int(spec.guard * sr)
-    step = n_sym + n_guard
-    return max(0, (n_samples - start) // step)
+    GAIN = 0.5
+
+    def __init__(self, sig: np.ndarray, sr: int, start: int, spec: ModeSpec):
+        self.sig, self.sr, self.start, self.spec = sig, sr, start, spec
+        self.n_sym = _steady(spec, sr)
+        self.margin = int(self.n_sym * 0.15)
+        self.win = self.n_sym - 2 * self.margin
+        self.window = np.hanning(self.win)
+        t = np.arange(self.win) / sr
+        self.basis = np.exp(-2j * np.pi * np.outer(np.asarray(spec.tones), t))  # (tones, win)
+        self.offset = 0.0  # samples: how far the sender's clock has drifted from ours
+        self._grid = _grid(spec, sr, 64)
+
+    def _bounds(self, k: int) -> tuple[int, int]:
+        if k + 1 >= len(self._grid):
+            self._grid = _grid(self.spec, self.sr, max(2 * len(self._grid), k + 2))
+        return int(self._grid[k]), int(self._grid[k + 1])
+
+    def end_of(self, k: int) -> int:
+        """Sample just after symbol ``k`` (exclusive), drift included."""
+        return self.start + self._bounds(k)[1] + int(round(self.offset))
+
+    def need(self, k: int) -> int:
+        """Samples of signal required to read symbol ``k`` (with room for drift)."""
+        b0, b1 = self._bounds(k)
+        end = b1 if self.spec.screech else b0 + self.n_sym
+        # signed: a sender whose clock runs fast finishes *earlier* than nominal
+        return self.start + end + int(round(self.offset)) + self.margin + 1
+
+    def _energy(self, s: int, tone: int | None = None):
+        seg = self.sig[s:s + self.win]
+        if len(seg) < self.win:
+            seg = np.pad(seg, (0, self.win - len(seg)))
+        spec = self.basis if tone is None else self.basis[tone:tone + 1]
+        return np.abs(spec @ (seg * self.window))
+
+    def symbol(self, k: int) -> int:
+        b0, b1 = self._bounds(k)
+        steady = b1 - self.n_sym if self.spec.screech else b0  # screech: glide first, then the tone
+        s = self.start + steady + self.margin + int(round(self.offset))
+        sym = int(np.argmax(self._energy(s)))
+        e = self.margin
+        early = float(self._energy(s - e, sym)[0])
+        late = float(self._energy(s + e, sym)[0])
+        if early + late > 0:
+            # the drift itself can add up to many symbols' worth over a long
+            # message; what's limited is how far one noisy symbol can pull us
+            self.offset += self.GAIN * e * (late - early) / (late + early)
+        return sym
 
 
 def data_start(pre_at: int, sr: int) -> int:
@@ -253,22 +304,21 @@ def try_decode_at(sig: np.ndarray, sr: int, pre_at: int, spec: ModeSpec, key: st
     Returns (Message, end_sample). Raises codec.NeedMore with ``needed`` in
     *samples* (absolute), or codec.BadFrame.
     """
-    start = data_start(pre_at, sr)
-    step = int(spec.symbol * sr) + int(spec.guard * sr)
-    avail = _symbols_available(len(sig), sr, start, spec)
+    d = _Demod(sig, sr, data_start(pre_at, sr), spec)
     per = spec.symbols_per_byte
-    have_bytes = 0
-    data = b""
+    symbols: list[int] = []
     want = 1
     while True:
-        if want * per > avail:
-            raise codec.NeedMore(start + want * per * step)
-        syms = _demod_symbols(sig, sr, start, spec, have_bytes * per, (want - have_bytes) * per)
-        data += symbols_to_bytes(syms, spec.bits)
-        have_bytes = want
+        target = want * per
+        while len(symbols) < target:
+            # check one symbol at a time: the drift estimate improves as we go,
+            # and a fast sender's frame ends earlier than the nominal grid says
+            if d.need(len(symbols)) > len(sig):
+                raise codec.NeedMore(d.need(target - 1))
+            symbols.append(d.symbol(len(symbols)))
         try:
-            msg, used = codec.parse_frame(data, key, spec.id)
-            return msg, start + used * per * step
+            msg, used = codec.parse_frame(symbols_to_bytes(symbols, spec.bits), key, spec.id)
+            return msg, d.end_of(used * per - 1)
         except codec.NeedMore as e:
             want = e.needed
 
@@ -294,7 +344,13 @@ def decode_audio(sig: np.ndarray, sr: int = DEFAULT_SR, mode: str = "auto", key:
 
 
 class StreamDecoder:
-    """Incremental decoder for live audio (microphone / monitor source)."""
+    """Incremental decoder for live audio (microphone / monitor source).
+
+    Keeps a list of candidate frames (where a sync chirp was heard). A
+    candidate that is still arriving never blocks the ones after it: if a
+    transmission is cut off half way (someone switched off mid-screech),
+    the next complete message is still decoded straight away.
+    """
 
     def __init__(self, sr: int = DEFAULT_SR, mode: str = "auto", key: str | None = None,
                  speed: float = 1.0, threshold: float = 0.45, max_buffer_seconds: float = 120.0):
@@ -303,58 +359,74 @@ class StreamDecoder:
         self.threshold = threshold
         self.specs = [get_mode(m, speed) for m in (MODES if mode == "auto" else [mode])]
         self.buf = np.zeros(0, dtype=np.float32)
+        self.base = 0                 # absolute sample index of buf[0]
         self.max_buffer = int(max_buffer_seconds * sr)
         self._pre_len = int(PREAMBLE_SECONDS * sr)
-        self._last_scan = 0
-        self._wait_until = 0  # buffer length needed before the next scan is worthwhile
+        self._searched = 0            # absolute index up to which chirps were searched
+        self._cands: dict[int, int] = {}  # absolute chirp position -> samples needed before retrying
 
     def feed(self, samples: np.ndarray) -> list[codec.Message]:
         self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=np.float32).ravel()])
         if len(self.buf) > self.max_buffer:
-            drop = len(self.buf) - self.max_buffer
-            self.buf = self.buf[drop:]
-            self._wait_until = max(0, self._wait_until - drop)
-        if len(self.buf) < self._wait_until or len(self.buf) - self._last_scan < self.sr // 4:
-            return []
-        return self._scan()
+            self._drop(len(self.buf) - self.max_buffer)
+        if self.base + len(self.buf) - self._searched < self.sr // 4:
+            return self._try(final=False)  # not enough new audio to look for chirps yet
+        self._search()
+        return self._try(final=False)
 
     def flush(self) -> list[codec.Message]:
-        """Scan whatever is buffered now (call when the input pauses or ends)."""
-        return self._scan() if len(self.buf) else []
+        """Decode whatever is buffered now (call when the input pauses or ends)."""
+        if not len(self.buf):
+            return []
+        self._search()
+        return self._try(final=True)
 
-    def _scan(self) -> list[codec.Message]:
+    # -- internals -------------------------------------------------------
+    def _drop(self, n: int) -> None:
+        n = min(n, len(self.buf))
+        self.buf = self.buf[n:]
+        self.base += n
+        self._cands = {p: need for p, need in self._cands.items() if p >= self.base}
+        self._searched = max(self._searched, self.base)
+
+    def _search(self) -> None:
+        # search only the new audio, with a chirp's length of overlap so one
+        # straddling the boundary is still found
+        lo = max(self.base, self._searched - self._pre_len)
+        for p in find_preambles(self.buf[lo - self.base:], self.sr, self.threshold):
+            p += lo
+            if all(abs(p - q) >= self._pre_len for q in self._cands):
+                self._cands[p] = 0
+        self._searched = self.base + len(self.buf)
+
+    def _try(self, final: bool) -> list[codec.Message]:
         out: list[codec.Message] = []
-        while True:
-            self._last_scan = len(self.buf)
-            self._wait_until = 0
-            peaks = find_preambles(self.buf, self.sr, self.threshold)
-            progressed = False
-            for p in peaks:
-                waiting = None
-                for spec in self.specs:
-                    try:
-                        msg, end = try_decode_at(self.buf, self.sr, p, spec, self.key)
-                    except codec.NeedMore as e:
-                        waiting = e.needed if waiting is None else min(waiting, e.needed)
-                        continue
-                    except codec.BadFrame:
-                        continue
-                    out.append(msg)
-                    self.buf = self.buf[end:]
-                    progressed = True
-                    break
-                if progressed:
-                    break
-                if waiting is not None:
-                    # a plausible frame is still arriving: keep it, drop what's before
-                    self.buf = self.buf[p:]
-                    self._wait_until = waiting - p
-                    self._last_scan = len(self.buf)
-                    return out
-            if not progressed:
-                # nothing pending: keep only enough tail to catch a chirp that's cut off
-                keep = self._pre_len * 2
-                if len(self.buf) > keep:
-                    self.buf = self.buf[-keep:]
-                self._last_scan = len(self.buf)
-                return out
+        end = self.base + len(self.buf)
+        for p in sorted(self._cands):
+            if p not in self._cands or (self._cands[p] > end and not final):
+                continue  # still arriving
+            waiting = None
+            for spec in self.specs:
+                try:
+                    msg, stop = try_decode_at(self.buf, self.sr, p - self.base, spec, self.key)
+                except codec.NeedMore as e:
+                    need = self.base + e.needed
+                    waiting = need if waiting is None else min(waiting, need)
+                    continue
+                except codec.BadFrame:
+                    continue
+                out.append(msg)
+                stop += self.base
+                # everything before the end of this frame is settled
+                self._cands = {q: n for q, n in self._cands.items() if q >= stop}
+                break
+            else:
+                if waiting is None or final:
+                    self._cands.pop(p, None)  # not a frame after all (or it never finished)
+                else:
+                    self._cands[p] = waiting
+        # keep audio from the oldest open candidate, or a chirp's worth of tail
+        keep_from = min(self._cands) if self._cands else end - 2 * self._pre_len
+        if keep_from > self.base:
+            self._drop(keep_from - self.base)
+        return out

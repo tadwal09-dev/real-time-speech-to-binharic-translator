@@ -11,9 +11,13 @@ from .stt import LIVE
 
 try:
     from rich.console import Console
+    from rich.markup import escape as _esc
     from rich.text import Text
 except ImportError:  # rich is optional; fall back to plain prints
     Console = None
+
+    def _esc(text: str) -> str:
+        return text
 
 BANNER = r"""
   ┌─┐┬┌┐┌┬ ┬┌─┐┬─┐┬┌─┐
@@ -91,6 +95,8 @@ class Printer:
         elif kind == "level" and self.test and self._tty:
             self._meter(ev["level"])
         elif kind == "partial":
+            if not self._tty:
+                return  # an in-place line only makes sense on a terminal, not in a log/journal
             with self._lock:
                 text = ev["text"]
                 if not text:
@@ -117,10 +123,6 @@ class Printer:
         elif kind == "received":
             style = "yellow" if ev["locked"] else "bold green"
             self._out(f"[dim]{t}[/] [{style}]▼ {_esc(ev['text'])}[/]", f"{t} << {ev['text']}")
-
-
-def _esc(s: str) -> str:
-    return s.replace("[", r"\[")
 
 
 def describe(tr: Translator) -> str:

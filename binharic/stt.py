@@ -16,9 +16,12 @@ changes its mind about.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,7 +34,8 @@ from .vad import EnergyVAD
 STT_SR = 16000
 PHRASE, LIVE = "phrase", "live"
 
-WHISPER_MODELS = ["tiny.en", "base.en", "small.en", "medium.en", "large-v3", "distil-large-v3"]
+WHISPER_MODELS = ["tiny.en", "base.en", "small.en", "medium.en", "tiny", "base", "small", "medium",
+                  "large-v1", "large-v2", "large-v3", "large-v3-turbo", "turbo", "distil-large-v3"]
 DEFAULT_WHISPER = "small.en"
 DEFAULT_WHISPER_LIVE = "base.en"  # quick interim passes; the final pass uses the main model
 DEFAULT_VOSK = "vosk-model-small-en-us-0.15"
@@ -48,6 +52,19 @@ def _short(e: Exception) -> str:
 
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+# what Whisper tends to "hear" in a breath, a click or silence (it was trained
+# on subtitled video); only dropped when that's *all* a short utterance contains
+_HALLUCINATIONS = {
+    "you", "thank you", "thank you very much", "thanks for watching", "thank you for watching",
+    "thanks for watching!", "please subscribe", "bye", "bye bye", "subtitles by the amara.org community",
+}
+
+
+def _is_hallucination(text: str, seconds: float) -> bool:
+    norm = re.sub(r"[^\w' !.]", "", text.lower()).strip(" .!")
+    return seconds < 2.5 and norm in _HALLUCINATIONS
 
 
 # --------------------------------------------------------------------------
@@ -76,13 +93,15 @@ class WhisperEngine(Engine):
     name = "whisper"
 
     def __init__(self, model: str = DEFAULT_WHISPER, device: str = "auto", compute_type: str = "auto",
-                 language: str | None = "en", beam_size: int = 5, live_interval: float = 0.8,
+                 language: str | None = None, beam_size: int = 5, live_interval: float = 0.8,
                  live_model: str | None = DEFAULT_WHISPER_LIVE):
         from . import gpu
 
         if model.endswith(".en"):
-            language = "en"
-        self.language = language
+            language = "en"  # English-only models
+        elif live_model and live_model.endswith(".en") and language != "en":
+            live_model = model  # an English-only live model would garble other languages
+        self.language = language  # None = detect it
         self.beam_size = beam_size
         self.live_interval = live_interval
         self.prompt = ""
@@ -149,7 +168,8 @@ class WhisperEngine(Engine):
             without_timestamps=True)
         # drop what Whisper invents over breath/keyboard noise ("Thank you.")
         kept = [s.text for s in segments if not (s.no_speech_prob > 0.6 and s.avg_logprob < -0.8)]
-        return _clean(" ".join(kept))
+        text = _clean(" ".join(kept))
+        return "" if _is_hallucination(text, len(audio) / STT_SR) else text
 
     def begin(self) -> None:
         self._buf, self._since = [], 0
@@ -196,6 +216,9 @@ class VoskEngine(Engine):
 
         vosk.SetLogLevel(-1)
         path = Path(model_path).expanduser() if model_path else _find_vosk_model()
+        if not (path / "conf").is_dir() and not (path / "am").is_dir():
+            raise RuntimeError(f"'{path}' isn't a Vosk model folder - download one with "
+                               "`binharic download-model --engine vosk`")
         self.model = vosk.Model(str(path))
         self._vosk = vosk
         self.rec = None
@@ -238,13 +261,25 @@ def have_whisper() -> bool:
         return False
 
 
-def make_engine(name: str = "auto", model: str | None = None, device: str = "auto",
-                live_model: str | None = DEFAULT_WHISPER_LIVE, beam: int = 5) -> Engine:
+def resolve_engine(name: str = "auto") -> str:
     if name == "auto":
-        name = "whisper" if have_whisper() else "vosk"
+        return "whisper" if have_whisper() else "vosk"
+    return name
+
+
+def make_engine(name: str = "auto", model: str | None = None, device: str = "auto",
+                live_model: str | None = DEFAULT_WHISPER_LIVE, beam: int = 5,
+                language: str | None = None) -> Engine:
+    name = resolve_engine(name)
     if name == "whisper":
-        return WhisperEngine(model or DEFAULT_WHISPER, device=device, live_model=live_model, beam_size=beam)
+        return WhisperEngine(model or DEFAULT_WHISPER, device=device, live_model=live_model,
+                             beam_size=beam, language=language)
     if name == "vosk":
+        # a Whisper size like "base.en" is not a Vosk model folder: use the default one
+        if model in WHISPER_MODELS:
+            model = None
+        elif model and not Path(model).expanduser().exists():
+            raise RuntimeError(f"Vosk model folder '{model}' doesn't exist")
         return VoskEngine(model)
     raise ValueError(f"unknown engine {name!r}")
 
@@ -264,11 +299,17 @@ def download(engine: str = "whisper", model: str | None = None) -> str:
     if target.exists():
         return str(target)
     dest.mkdir(parents=True, exist_ok=True)
-    zpath = dest / f"{name}.zip"
-    urllib.request.urlretrieve(f"https://alphacephei.com/vosk/models/{name}.zip", zpath)
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall(dest)
-    zpath.unlink()
+    # download and unpack into a scratch folder, then move it in one step: an
+    # interrupted download never leaves a half-unpacked model behind
+    with tempfile.TemporaryDirectory(dir=dest) as tmp:
+        zpath = Path(tmp) / f"{name}.zip"
+        urllib.request.urlretrieve(f"https://alphacephei.com/vosk/models/{name}.zip", zpath)
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(tmp)
+        unpacked = Path(tmp) / name
+        if not unpacked.is_dir():
+            raise RuntimeError(f"unexpected layout in {name}.zip")
+        shutil.move(str(unpacked), str(target))
     return str(target)
 
 
@@ -281,6 +322,36 @@ def _words(text: str) -> list[str]:
 
 def _norm(w: str) -> str:
     return re.sub(r"[^\w']", "", w.lower())
+
+
+def remaining_words(sent: list[str], final: list[str]) -> list[str]:
+    """The part of ``final`` that comes after the words already sent.
+
+    Aligns the two instead of counting words, so a final pass that merges
+    ("spirit is" -> "spirit's"), splits or rewords things neither drops nor
+    repeats a word.
+    """
+    if not sent:
+        return final
+    a, b = [_norm(w) for w in sent], [_norm(w) for w in final]
+    blocks = [m for m in difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks() if m.size]
+    if blocks:
+        after, leftover = blocks[-1].b + blocks[-1].size, a[blocks[-1].a + blocks[-1].size:]
+    else:
+        after, leftover = 0, a
+    if not leftover:
+        return final[after:]
+    # sent words after the last match were re-heard differently (merged,
+    # split or corrected): skip the final words whose letters best match them
+    letters = "".join(leftover).replace("'", "")
+    best_k, best = len(leftover), 0.5
+    acc = ""
+    for k, w in enumerate(b[after:after + len(leftover) + 2], start=1):
+        acc += w.replace("'", "")
+        score = difflib.SequenceMatcher(None, letters, acc).ratio()
+        if score > best:
+            best_k, best = k, score
+    return final[after + best_k:]
 
 
 def agreed_prefix(a: list[str], b: list[str]) -> int:
@@ -378,7 +449,9 @@ class Transcriber:
         if self.send_mode != LIVE:
             return
         words = _words(hyp)
-        stable = agreed_prefix(self._prev, words)
+        # the newest word may be cut off mid-way ("omni" for "omnissiah"): only
+        # commit words that two hypotheses agree on *and* that aren't the last
+        stable = min(agreed_prefix(self._prev, words), len(words) - 1)
         self._prev = words
         if stable > self._committed:
             self.on_send(" ".join(words[self._committed:stable]), False)
@@ -400,9 +473,9 @@ class Transcriber:
         self._spec, self._paused = None, False
         words = _words(text)
         if self.send_mode == LIVE:
-            # the final, more careful pass may reword things; send only what
+            # the final pass may reword or re-split things; send only what
             # comes after the words already screeched
-            rest = words[self._committed:]
+            rest = remaining_words(self._prev[:self._committed], words)
             if rest:
                 self.on_send(" ".join(rest), True)
         elif words:

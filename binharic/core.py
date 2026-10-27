@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -36,7 +36,6 @@ from .vad import Decimator
 
 SR = 48000
 BLOCK = SR // 50  # 20 ms
-MAX_CHUNK_BYTES = 240
 
 
 @dataclass
@@ -61,6 +60,7 @@ class Settings:
     hear: str | None = None     # source to decode incoming binharic from
     hear_key: str | None = None
     beam: int = 5               # whisper beam size for the final pass (1 = fastest)
+    language: str | None = None # whisper language for multilingual models (None = detect)
     partials: bool = True       # show what you're saying while you say it (phrase mode)
     test: bool = False          # test mode: screech to your speakers, decode it back, time it
     test_air: bool = False      # ...and also decode what the mic hears (speaker -> mic)
@@ -104,14 +104,6 @@ Event = dict
 Listener = Callable[[str, Event], None]
 
 
-@dataclass
-class Sent:
-    text: str
-    final: bool
-    seconds: float
-    at: float = field(default_factory=time.time)
-
-
 class Translator:
     def __init__(self, settings: Settings):
         self.s = settings
@@ -143,6 +135,7 @@ class Translator:
         self._air_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=600)
         self._mute_until = 0.0
         self._last_arrival = 0.0
+        self._target_lock = threading.Lock()
 
     # -- events -----------------------------------------------------------
     def subscribe(self, fn: Listener) -> None:
@@ -252,15 +245,21 @@ class Translator:
 
     def say(self, text: str) -> None:
         """Queue typed text for screeching (works even while OFF)."""
-        self._queue_text(text, True, force=True)
+        self._queue_text(" ".join(text.split()), True, force=True)
+
+    def request_stop(self) -> None:
+        """Ask the layer to shut down (safe from a signal handler)."""
+        self._stop.set()
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
         if self.s.control_socket:
             self._start_control()  # first, so a second copy fails before touching audio
         self._resolve_devices()
-        self._out = Output(SR, sink=self.s.sink or self.speakers, device=self.s.output_device, blocksize=BLOCK)
-        self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2)
+        warn = lambda m: self.log(m, "warn")  # noqa: E731
+        self._out = Output(SR, sink=self.s.sink or self.speakers, device=self.s.output_device, blocksize=BLOCK,
+                           notify=warn, before_reconnect=self._recreate_virtual_mic)
+        self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2, notify=warn)
         out = pulse.describe(self.s.sink, "sinks") if self.s.sink else self.speakers_label
         self.log(f"mic: {self.mic_label}  →  screech: {out}"
                  + (f"  (test mode plays on: {self.speakers_label})" if self.s.test and self.s.sink else ""))
@@ -344,6 +343,15 @@ class Translator:
         self.mic_label = self.s.input_device or "default input"
         if not pulse.available():
             return
+        if self.s.sink == pulse.SINK and not pulse.virtual_mic_exists():
+            pulse.mic_up()
+        # wrong names: say so now, with the list of real ones
+        if self.s.sink:
+            pulse.check_device(self.s.sink, "sinks")
+        if self.s.source:
+            pulse.check_device(self.s.source, "sources")
+        if self.s.hear:
+            pulse.check_device(self.s.hear, "sources")
         if not self.s.source and not self.s.input_device:
             self.s.source = pulse.real_source()
         if self.s.source:
@@ -352,6 +360,13 @@ class Translator:
             self.speakers = pulse.real_sink()
             if self.speakers:
                 self.speakers_label = pulse.describe(self.speakers, "sinks")
+
+    def _recreate_virtual_mic(self) -> None:
+        """After a sound-server restart the virtual devices are gone: rebuild
+        them before reconnecting to them."""
+        if self.s.sink == pulse.SINK and not pulse.virtual_mic_exists():
+            pulse.mic_up()
+            self.log("re-created the Binharic Mic after the sound server restarted", "warn")
 
     # -- threads ----------------------------------------------------------
     def _mic_loop(self):
@@ -376,7 +391,8 @@ class Translator:
 
     def _stt_loop(self):
         self.log("loading speech recognition…")
-        engine = make_engine(self.s.engine, self.s.model, self.s.device, self.s.live_model, self.s.beam)
+        engine = make_engine(self.s.engine, self.s.model, self.s.device, self.s.live_model, self.s.beam,
+                             self.s.language)
         self.engine_name = f"{engine.name} · {engine.label}" if engine.label != engine.name else engine.name
         self.transcriber = Transcriber(engine, self.s.send_mode, on_speech=self._on_speech,
                                        on_partial=lambda t: self.emit("partial", text=t),
@@ -457,8 +473,10 @@ class Translator:
     def _queue_text(self, text: str, final: bool, force: bool = False, meta: dict | None = None):
         if not text or (not (self.s.enabled or self.s.test) and not force):
             return
+        meta = dict(meta or {}, forced=force)
         with self._pending_lock:
-            self._pending.append((text, meta or {}))
+            self._pending.append((text, meta))
+            self._abort.clear()  # a new message after an OFF: let it play
         self.emit("queued", text=text, final=final)
 
     def _take_pending(self) -> tuple[str, dict] | None:
@@ -468,7 +486,9 @@ class Translator:
             text = " ".join(t for t, _ in self._pending)
             meta = {}
             for _, m in self._pending:
+                forced = meta.get("forced", False) or m.get("forced", False)
                 meta.update(m)
+                meta["forced"] = forced
             self._pending.clear()
         return text, meta
 
@@ -476,14 +496,22 @@ class Translator:
         """Where the screech goes: the Binharic Mic, or your speakers in test mode."""
         if not self.s.test or not self.s.sink:
             return self._out
-        if self._local_out is None:
-            self._local_out = Output(SR, sink=self.speakers, device=self.s.output_device, blocksize=BLOCK)
+        with self._target_lock:  # the GUI thread and the output thread can both get here
+            if self._local_out is None:
+                self._local_out = Output(SR, sink=self.speakers, device=self.s.output_device, blocksize=BLOCK,
+                                         notify=lambda m: self.log(m, "warn"))
         return self._local_out
 
     def _out_loop(self):
         out = self._out
         silence = np.zeros(BLOCK, dtype=np.float32)
+        checked = 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
+            if now - checked > 0.5:  # reconnect as soon as the sound server comes back
+                checked = now
+                for o in {id(o): o for o in (self._out, self._local_out) if o}.values():
+                    o.ensure_alive()
             item = self._take_pending()
             if item:
                 self._play_text(self._target(), *item)
@@ -508,16 +536,9 @@ class Translator:
 
     def _play_text(self, out: Output, text: str, meta: dict | None = None):
         meta = meta or {}
-        chunks, cur = [], b""
-        for word in text.split(" "):
-            w = word.encode("utf-8")
-            if cur and len(cur) + 1 + len(w) > MAX_CHUNK_BYTES:
-                chunks.append(cur.decode("utf-8", "ignore"))
-                cur = b""
-            cur = (cur + b" " + w) if cur else w
-        if cur:
-            chunks.append(cur.decode("utf-8", "ignore"))
-        self._abort.clear()
+        if not (self.s.enabled or self.s.test or meta.get("forced")):
+            return  # switched OFF after this was queued
+        chunks = codec.split_text(text)
         self.screeching.set()
         self._changed()
         s = self.s
@@ -580,7 +601,7 @@ class Translator:
                 self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
 
     def _hear_loop(self):
-        self._hear_in = Input(SR, source=self.s.hear, blocksize=BLOCK * 5)
+        self._hear_in = Input(SR, source=self.s.hear, blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
         dec = modem.StreamDecoder(SR, "auto", key=self.s.hear_key or self.s.key, speed=self.s.speed)
         self.log(f"decoding incoming binharic from {self.s.hear}")
         while not self._stop.is_set():
@@ -617,12 +638,16 @@ class Translator:
             except OSError:
                 break
             with conn:
+                conn.settimeout(2.0)  # a client that connects and says nothing can't block hotkeys
                 try:
                     line = conn.makefile().readline().strip()
                     reply = self.handle(line)
                 except Exception as e:
                     reply = f"error: {e}"
-                conn.sendall(reply.encode() + b"\n")
+                try:
+                    conn.sendall(reply.encode() + b"\n")
+                except OSError:
+                    pass  # the client gave up waiting; the next one is fine
 
     def handle(self, line: str) -> str:
         cmd, _, arg = line.partition(" ")

@@ -63,20 +63,23 @@ class Dashboard:
         C = curses.color_pair
 
         def put(y, x, text, attr=0):
-            if 0 <= y < h and x < w - 1:
-                scr.addnstr(y, x, text, w - 1 - x, attr)
+            if 0 <= y < h and 0 <= x < w - 1:
+                try:
+                    scr.addnstr(y, x, text, w - 1 - x, attr)
+                except curses.error:  # e.g. a wide character at the edge: skip, don't crash
+                    pass
 
         put(0, 0, " ⚙ BINHARIC ".ljust(w - 1), C(1) | curses.A_BOLD)
         on = s.enabled
         put(0, 13, " ON " if on else " OFF ", (C(2) if on else C(3)) | curses.A_BOLD | curses.A_REVERSE)
-        status = "loading model…" if not self.tr.ready else self.tr.engine_name
-        put(0, w - len(status) - 2, status, C(1))
+        status = ("loading model…" if not self.tr.ready else self.tr.engine_name)[: max(0, w - 22)]
+        put(0, max(19, w - len(status) - 2), status, C(1))
 
         send = "AS I TALK" if s.send_mode == LIVE else "AFTER I FINISH"
         x = 1
         for label, val, hi in [("send", send, True), ("mode", s.mode, False), ("speed", f"{s.speed:.1f}x", False),
                                ("key", "set" if s.key else "none", bool(s.key)),
-                               ("out", s.sink or "default", False),
+                               ("out", s.sink or self.tr.speakers_label, False),
                                ("passthrough", "on" if s.passthrough else "off", False)]:
             put(2, x, f"{label}: ", curses.A_DIM)
             x += len(label) + 2
@@ -104,7 +107,8 @@ class Dashboard:
         put(4, 7 + width, state, attr)
 
         put(6, 1, "hearing: ", curses.A_DIM)
-        put(6, 10, (self.partial[-(w - 12):] if self.partial else "…"), curses.A_ITALIC if self.partial else curses.A_DIM)
+        italic = getattr(curses, "A_ITALIC", curses.A_NORMAL)
+        put(6, 10, (self.partial[-max(1, w - 12):] if self.partial else "…"), italic if self.partial else curses.A_DIM)
 
         put(8, 0, "─" * (w - 1), curses.A_DIM)
         rows = h - 11
@@ -142,7 +146,7 @@ class Dashboard:
 
     def handle_key(self, scr, ch) -> bool:
         tr = self.tr
-        if ch in (ord("q"), 27):
+        if ch in (ord("q"), ord("Q")):  # not Esc: arrow keys start with Esc in many terminals
             return False
         if ch == ord(" "):
             tr.toggle()
@@ -170,12 +174,22 @@ class Dashboard:
         return True
 
     def loop(self, scr):
-        curses.curs_set(0)
-        curses.start_color()
-        curses.use_default_colors()
-        for i, fg in enumerate([curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_RED,
-                                curses.COLOR_YELLOW, curses.COLOR_CYAN, curses.COLOR_BLACK], start=1):
-            curses.init_pair(i, fg, curses.COLOR_RED if i == 6 else -1)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        scr.keypad(True)  # arrow/function keys arrive as single codes, not Esc sequences
+        background = curses.COLOR_BLACK
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                background = -1
+            except curses.error:  # terminals without default-colour support
+                pass
+            for i, fg in enumerate([curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_RED,
+                                    curses.COLOR_YELLOW, curses.COLOR_CYAN, curses.COLOR_BLACK], start=1):
+                curses.init_pair(i, fg, curses.COLOR_RED if i == 6 else background)
         scr.nodelay(True)
         while not self.tr.stopped:
             self.pump()

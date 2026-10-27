@@ -89,10 +89,30 @@ def test_phrase_mode_sends_once_after_you_finish():
 def test_live_mode_sends_words_as_they_stabilise():
     hyps = ["praise", "praise the", "praise the omni", "praise the omnissiah", "praise the omnissiah"]
     sent, _ = run_transcriber(LIVE, hyps, "praise the Omnissiah now")
-    # committed only once two hypotheses agree; "omni" is never sent
-    assert [t for t, _ in sent] == ["praise", "the", "omnissiah", "now"]
+    # committed once two hypotheses agree, never the newest word; "omni" is never sent
+    assert [t for t, _ in sent] == ["praise", "the", "Omnissiah now"]
     assert sent[-1][1] is True
-    assert " ".join(t for t, _ in sent) == "praise the omnissiah now"
+    assert " ".join(t for t, _ in sent).lower() == "praise the omnissiah now"
+
+
+def test_live_mode_never_sends_a_cut_off_last_word():
+    # you're mid-word for two passes in a row: "omni" agrees twice but must not go out
+    hyps = ["praise the omni", "praise the omni", "praise the omnissiah"]
+    sent, _ = run_transcriber(LIVE, hyps, "praise the omnissiah")
+    words = " ".join(t for t, _ in sent).split()
+    assert "omni" not in words and words == ["praise", "the", "omnissiah"]
+
+
+@pytest.mark.parametrize("sent,final,rest", [
+    ("the machine spirit is", "The machine spirit's pleased, the reactor", "pleased, the reactor"),
+    ("praise the omni", "Praise the Omnissiah now", "now"),
+    ("send more service", "Send more servitors to the forge", "to the forge"),
+    ("cannot", "can not do it", "do it"),
+    ("hello there", "hello there", ""),
+])
+def test_live_final_pass_continues_where_it_left_off(sent, final, rest):
+    from binharic.stt import remaining_words
+    assert " ".join(remaining_words(sent.split(), final.split())) == rest
 
 
 def test_agreement_ignores_case_and_punctuation():
@@ -104,7 +124,7 @@ class FakeIn:
     def __init__(self, sig):
         self.sig, self.i = sig, 0
 
-    def __call__(self, sr, source=None, device=None, blocksize=4800):
+    def __call__(self, sr, source=None, device=None, blocksize=4800, **kw):
         self.bs = blocksize
         return self
 
@@ -122,10 +142,13 @@ class FakeOut:
     needs_feeding = True
     latency = 0.0
 
+    def ensure_alive(self):
+        pass
+
     def __init__(self):
         self.blocks = []
 
-    def __call__(self, sr, sink=None, device=None, blocksize=960):
+    def __call__(self, sr, sink=None, device=None, blocksize=960, **kw):
         return self
 
     def write(self, s):
@@ -247,7 +270,7 @@ def test_test_mode_plays_locally_verifies_and_times(monkeypatch, tmp_path):
     outs = []
 
     class Out(FakeOut):
-        def __call__(self, sr, sink=None, device=None, blocksize=960):
+        def __call__(self, sr, sink=None, device=None, blocksize=960, **kw):
             o = FakeOut()
             o.sink = sink
             outs.append(o)
