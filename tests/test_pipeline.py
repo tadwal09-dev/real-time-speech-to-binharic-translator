@@ -27,9 +27,18 @@ def test_vad_detects_start_and_end_and_keeps_all_speech():
     events = []
     feed_blocks(lambda b: events.extend(vad.feed(b)), sig, 1600)
     kinds = [e.kind for e in events if e.kind != "audio"]
-    assert kinds == ["start", "end"]
+    assert kinds == ["start", "pause", "end"]
+    assert vad.since_voice >= 1.0 * STT_SR  # counts the quiet after you stopped
     speech = sum(len(e.audio) for e in events)
     assert 2.0 * STT_SR <= speech <= 3.0 * STT_SR  # pre-roll + speech + hangover
+
+
+def test_vad_pause_then_resume_keeps_one_utterance():
+    vad = EnergyVAD(STT_SR, end_ms=600, pause_ms=200)
+    sig = np.concatenate([quiet(0.5), tone_burst(1), quiet(0.35), tone_burst(1), quiet(1)])
+    events = []
+    feed_blocks(lambda b: events.extend(vad.feed(b)), sig, 1600)
+    assert [e.kind for e in events if e.kind != "audio"] == ["start", "pause", "resume", "pause", "end"]
 
 
 def test_decimator_preserves_tone_and_rejects_alias():
@@ -188,3 +197,82 @@ def test_second_instance_refuses(monkeypatch, tmp_path):
     again = core.Translator(core.Settings())
     again.start()
     again.stop()
+
+
+class PeekingEngine(ScriptedEngine):
+    """Supports speculative finals; counts how often the slow final pass runs."""
+
+    def __init__(self, final):
+        super().__init__([], final)
+        self.peeks = self.finishes = 0
+
+    def peek(self, fast=False):
+        self.peeks += 1
+        return self.final
+
+    def finish(self, fast=False):
+        self.finishes += 1
+        return self.final
+
+    def discard(self):
+        pass
+
+
+def test_speculative_final_is_used_when_you_really_stopped():
+    eng = PeekingEngine("done talking")
+    sent = []
+    tr = Transcriber(eng, PHRASE, on_send=lambda t, f: sent.append(t), end_ms=600)
+    feed_blocks(tr.feed, np.concatenate([quiet(0.5), tone_burst(1), quiet(1.2)]), 800)
+    assert sent == ["done talking"]
+    assert (eng.peeks, eng.finishes) == (1, 0) and tr.last_speculative
+
+
+def test_speculative_final_is_dropped_if_you_carry_on():
+    eng = PeekingEngine("whole sentence")
+    sent = []
+    tr = Transcriber(eng, PHRASE, on_send=lambda t, f: sent.append(t), end_ms=600)
+    # a 300 ms breath: long enough to trigger the early pass, short enough to keep talking
+    feed_blocks(tr.feed, np.concatenate([quiet(0.5), tone_burst(1), quiet(0.3), tone_burst(1), quiet(1.2)]), 800)
+    assert sent == ["whole sentence"]
+    assert eng.peeks == 2  # one wasted, one used
+
+
+def test_test_mode_plays_locally_verifies_and_times(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sr = core.SR
+    mic = FakeIn(np.concatenate([quiet(0.5, sr), tone_burst(1.2, sr), quiet(2.5, sr)]))
+    outs = []
+
+    class Out(FakeOut):
+        def __call__(self, sr, sink=None, device=None, blocksize=960):
+            o = FakeOut()
+            o.sink = sink
+            outs.append(o)
+            return o
+
+    monkeypatch.setattr(core, "Input", mic)
+    monkeypatch.setattr(core, "Output", Out())
+    monkeypatch.setattr(core, "make_engine", lambda *a, **k: PeekingEngine("testing one two"))
+    tr = core.Translator(core.Settings(enabled=False, test=True, sink="binharic_out", end_ms=300,
+                                       control_socket=False, key="k"))
+    events = []
+    tr.subscribe(lambda kind, ev: kind in ("sent", "verify") and events.append((kind, ev)))
+    tr.start()
+    deadline = time.time() + 20
+    while time.time() < deadline and not any(k == "verify" for k, _ in events):
+        time.sleep(0.05)
+    while tr.screeching.is_set():
+        time.sleep(0.05)
+    tr.stop()
+
+    sent = [e for k, e in events if k == "sent"]
+    verify = [e for k, e in events if k == "verify"]
+    assert sent and sent[0]["text"] == "testing one two" and sent[0]["test"]
+    assert 0 < sent[0]["latency_ms"] < 5000 and sent[0]["speculative"]
+    assert verify[0]["ok"] and verify[0]["decoded"] == "testing one two"
+    sink_out = next(o for o in outs if o.sink == "binharic_out")
+    local = next(o for o in outs if o.sink is None)
+    # the virtual mic got nothing; your speakers got the screech
+    assert not sink_out.blocks or np.abs(np.concatenate(sink_out.blocks)).max() == 0
+    played = np.concatenate(local.blocks)
+    assert [m.text for m in modem.decode_audio(played, sr, key="k")] == ["testing one two"]

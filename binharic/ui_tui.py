@@ -12,8 +12,8 @@ from . import modem
 from .core import Translator
 from .stt import LIVE
 
-KEYS = [("space", "on/off"), ("l", "finish ⇄ live"), ("m", "mode"), ("k", "key"), ("t", "type"),
-        ("p", "passthrough"), ("+/-", "speed"), ("q", "quit")]
+KEYS = [("space", "on/off"), ("l", "finish ⇄ live"), ("x", "test"), ("m", "mode"), ("k", "key"),
+        ("t", "type"), ("p", "pass"), ("+/-", "speed"), ("q", "quit")]
 
 
 class Dashboard:
@@ -40,6 +40,13 @@ class Dashboard:
                 self.partial = ev["text"]
             elif kind == "sent":
                 self.log.append((t, "sent", f"{ev['text']}   ·  {ev['hex']}"))
+                if ev.get("test") and "latency_ms" in ev:
+                    self.log.append((t, "info", f"⏱ {ev['latency_ms']:.0f} ms after you stopped · recognition "
+                                                f"{ev['stt_ms']:.0f} ms · synth {ev['synth_ms']:.0f} ms"))
+            elif kind == "verify":
+                via = "over the air" if ev["via"] == "air" else "round trip"
+                self.log.append((t, "recv" if ev["ok"] else "error",
+                                 f"{'✔' if ev['ok'] else '✖'} {via}: {ev['decoded']}"))
             elif kind == "received":
                 self.log.append((t, "locked" if ev["locked"] else "recv", ev["text"]))
             elif kind in ("log", "error"):
@@ -84,7 +91,9 @@ class Dashboard:
         put(4, 1, "mic ", curses.A_DIM)
         put(4, 5, "█" * filled, C(2) if self.tr.speaking else C(5))
         put(4, 5 + filled, "░" * (width - filled), curses.A_DIM)
-        if not on:
+        if s.test and not self.tr.screeching.is_set():
+            state, attr = "TEST MODE · say something", C(4) | curses.A_BOLD
+        elif not on:
             state, attr = ("voice passing through" if s.passthrough else "idle"), curses.A_DIM
         elif self.tr.screeching.is_set():
             state, attr = "▲ SCREECHING", C(1) | curses.A_BOLD
@@ -142,6 +151,8 @@ class Dashboard:
         elif ch == ord("m"):
             names = list(modem.MODES)
             tr.set_mode(names[(names.index(tr.s.mode) + 1) % len(names)])
+        elif ch == ord("x"):
+            tr.set_test(not tr.s.test)
         elif ch == ord("p"):
             tr.set_passthrough(not tr.s.passthrough)
         elif ch in (ord("+"), ord("=")):

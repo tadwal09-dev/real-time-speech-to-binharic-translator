@@ -86,3 +86,16 @@ def test_text_helpers():
     assert codec.to_hex("Hi") == "48 69"
     assert codec.from_binary("01001000 01101001") == "Hi"
     assert codec.from_hex("48 69") == "Hi"
+
+
+def test_stream_decoder_flush_catches_a_short_tail():
+    sr = 16000
+    sig = modem.encode_text("tail end", "binharic", sr=sr)
+    dec = modem.StreamDecoder(sr)
+    got = []
+    # one big block that ends just after the frame, then nothing more arrives
+    cut = len(sig) - int(0.05 * sr)
+    got += dec.feed(sig[: cut - sr // 8])
+    got += dec.feed(sig[cut - sr // 8:])
+    got += dec.flush()
+    assert [m.text for m in got] == ["tail end"]

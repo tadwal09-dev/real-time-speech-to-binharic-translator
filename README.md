@@ -58,6 +58,26 @@ Run `binharic -h` to see them all.
     faster to react but slightly less accurate, because it uses the quicker model for
     the live words.
 
+### Test mode: is it working?
+
+```sh
+binharic test            # say something; hear the screech on your speakers
+binharic test --air      # ...and check the mic can decode it back (use speakers, not headphones)
+binharic test --fast     # same, with the low-latency settings
+```
+
+Nothing goes to the Binharic Mic in test mode. For every phrase it shows:
+
+```
+▲ binharic The quick brown fox jumps over the lazy dog… (9.5s)
+  ⏱ screech started 1384 ms after you stopped talking · recognition 1143 ms (started early) · synth 96 ms
+  ✔ round trip OK in 74 ms: The quick brown fox jumps over the lazy dog…
+  ✔ over the air OK: The quick brown fox jumps over the lazy dog…
+```
+
+You can also switch it on in the GUI (*Test mode* checkbox or Ctrl+T), in the TUI (`x`), or
+on a running layer with `binharic test`, which toggles the service's test mode.
+
 ### Hotkeys
 
 Bind these in your WM / DE. Each one also shows a desktop notification.
@@ -85,6 +105,7 @@ accurate than the old Vosk engine and copes with accents and odd words. It uses 
 
 | Want | Use |
 |---|---|
+| Lowest latency | `--fast` (see above) |
 | Faster on a weak CPU | `--model base.en` |
 | Best accuracy on a strong PC | `--model medium.en` |
 | Best accuracy with an NVIDIA GPU | `--model large-v3 --device cuda` |
@@ -93,6 +114,29 @@ accurate than the old Vosk engine and copes with accents and odd words. It uses 
 
 For reference, on a 4-core CPU `small.en` takes about 3 s to transcribe 5 s of speech
 and `base.en` takes about 1 s.
+
+### Speed: how long until the screech starts
+
+The screech starts as soon as the recogniser has your sentence. Several things keep that short:
+
+* **Speculative final pass**: transcription starts 200 ms into a pause, while it is still
+  waiting to see whether you've finished. If you keep talking, that result is thrown away.
+* **Instant start**: the sync chirp is the same for every message, so it plays at once
+  while the rest of the screech is generated (about 90 ms, hidden behind the 180 ms chirp).
+* Low-latency audio buffers, and Whisper uses all your CPU cores.
+
+Measured on a 4-core CPU, from when you stop talking to the first screech sound:
+
+| Settings | Latency | Accuracy |
+|---|---|---|
+| default (`small.en`) | about 4.0 s | best |
+| `--fast` (`base.en`, greedy, no live transcript) | **about 1.3 s** | very good |
+| `--fast --model tiny.en` | about 0.9 s | poor |
+| any model with `--device cuda` (NVIDIA GPU) | a few hundred ms | same as the model |
+
+Almost all of that time is Whisper itself, which is already optimized C++
+(CTranslate2). The screech encoder and decoder together take under 1% of the time, so
+rewriting them in C++ wouldn't make it feel any faster. A GPU, or a faster CPU, would.
 
 ## Sound modes
 

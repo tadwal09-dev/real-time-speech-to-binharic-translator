@@ -32,7 +32,7 @@ class Decimator:
 
 @dataclass
 class VadEvent:
-    kind: str          # "start" | "audio" | "end"
+    kind: str          # "start" | "audio" | "pause" | "resume" | "end"
     audio: np.ndarray  # "start": pre-roll + onset; "audio": speech since last event
 
 
@@ -44,12 +44,14 @@ class EnergyVAD:
 
     ``feed`` returns events in order: ``start`` (carrying the audio just
     before and at onset), ``audio`` chunks while speech continues, and
-    ``end`` after ``end_ms`` of quiet. The threshold follows the background
+    ``end`` after ``end_ms`` of quiet. ``pause`` fires after ``pause_ms`` of
+    quiet (you *might* be done) and ``resume`` if you carry on, so callers
+    can start work early and throw it away if needed. The threshold follows the background
     noise floor, so it copes with fans and hum without tuning.
     """
 
     def __init__(self, sr: int, frame_ms: int = 20, start_ratio: float = 3.0, min_level: float = 0.006,
-                 start_ms: int = 60, end_ms: int = 700, preroll_ms: int = 300):
+                 start_ms: int = 60, end_ms: int = 700, preroll_ms: int = 300, pause_ms: int = 200):
         self.sr = sr
         self.frame_ms = frame_ms
         self.frame = sr * frame_ms // 1000
@@ -57,6 +59,8 @@ class EnergyVAD:
         self.min_level = min_level
         self.start_frames = max(1, start_ms // frame_ms)
         self.end_frames = max(1, end_ms // frame_ms)
+        self.pause_frames = max(1, min(pause_ms // frame_ms, self.end_frames - 1))
+        self.since_voice = 0  # samples since the last voiced frame
         self.preroll = sr * preroll_ms // 1000
         self.noise = min_level / 2
         self.level = 0.0
@@ -67,7 +71,8 @@ class EnergyVAD:
         self._history = _EMPTY
 
     def set_end_ms(self, ms: int) -> None:
-        self.end_frames = max(1, ms // self.frame_ms)
+        self.end_frames = max(2, ms // self.frame_ms)
+        self.pause_frames = max(1, min(self.pause_frames, self.end_frames - 1))
 
     def feed(self, x: np.ndarray) -> list[VadEvent]:
         events: list[VadEvent] = []
@@ -78,6 +83,8 @@ class EnergyVAD:
             rms = float(np.sqrt(np.mean(f * f)) + 1e-9)
             self.level = rms
             threshold = max(self.min_level, self.noise * self.start_ratio)
+            voiced = rms > threshold * 0.5
+            self.since_voice = 0 if (voiced and (self.speaking or rms > threshold)) else self.since_voice + len(f)
             if not self.speaking:
                 # noise floor tracks quiet frames quickly, loud ones slowly
                 rate = 0.05 if rms < self.noise * 2 else 0.002
@@ -92,9 +99,21 @@ class EnergyVAD:
                 continue
             chunk.append(f)
             # stay in speech while above ~half the start threshold
-            self._below = 0 if rms > threshold * 0.5 else self._below + 1
+            if voiced:
+                if self._below >= self.pause_frames:
+                    events.append(VadEvent("audio", np.concatenate(chunk)))
+                    chunk = []
+                    events.append(VadEvent("resume", _EMPTY))
+                self._below = 0
+            else:
+                self._below += 1
+                if self._below == self.pause_frames:
+                    events.append(VadEvent("audio", np.concatenate(chunk)))
+                    chunk = []
+                    events.append(VadEvent("pause", _EMPTY))
             if self._below >= self.end_frames:
-                events.append(VadEvent("audio", np.concatenate(chunk)))
+                if chunk:
+                    events.append(VadEvent("audio", np.concatenate(chunk)))
                 chunk = []
                 self.speaking = False
                 self._above = 0

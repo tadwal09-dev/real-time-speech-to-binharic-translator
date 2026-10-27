@@ -19,7 +19,7 @@ import numpy as np
 F_SETPIPE_SZ = 1031
 
 
-def _small_pipe(f, size: int = 8192) -> None:
+def _small_pipe(f, size: int = 4096) -> None:
     try:
         fcntl.fcntl(f.fileno(), F_SETPIPE_SZ, size)
     except OSError:
@@ -43,14 +43,14 @@ class Output:
         if sink:
             self._proc = subprocess.Popen(
                 [_require("pacat"), "--playback", f"--device={sink}", "--raw", "--format=s16le",
-                 f"--rate={sr}", "--channels=1", "--latency-msec=40",
+                 f"--rate={sr}", "--channels=1", "--latency-msec=25",
                  "--client-name=binharic", "--stream-name=binharic"],
                 stdin=subprocess.PIPE)
             _small_pipe(self._proc.stdin)
         else:
             import sounddevice as sd
             self._stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32",
-                                           device=device, blocksize=blocksize)
+                                           device=device, blocksize=blocksize, latency="low")
             self._stream.start()
 
     def write(self, samples: np.ndarray) -> None:
@@ -84,12 +84,12 @@ class Input:
         if source:
             self._proc = subprocess.Popen(
                 [_require("parec"), f"--device={source}", "--raw", "--format=s16le",
-                 f"--rate={sr}", "--channels=1", "--latency-msec=40", "--client-name=binharic"],
+                 f"--rate={sr}", "--channels=1", "--latency-msec=20", "--client-name=binharic"],
                 stdout=subprocess.PIPE)
         else:
             import sounddevice as sd
             self._stream = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
-                                          device=device, blocksize=blocksize)
+                                          device=device, blocksize=blocksize, latency="low")
             self._stream.start()
 
     def read(self) -> np.ndarray:

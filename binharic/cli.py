@@ -50,15 +50,20 @@ def _settings(args):
     from .stt import LIVE, PHRASE
 
     sink = pulse.resolve_sink(args.sink)
+    model, live_model, beam, pause, partials = args.model, args.live_model, 5, args.pause_ms, True
+    if args.fast:
+        # one quick model, greedy decoding, shorter pause, no interim transcripts
+        model, live_model, beam, partials = model or "base.en", None, 1, False
+        pause = min(pause, 450)
     return Settings(
         enabled=not args.start_off,
         send_mode=LIVE if args.live else PHRASE,
         mode=args.mode, key=_key(args.key), speed=args.speed, volume=args.volume,
-        passthrough=args.passthrough, engine=args.engine, model=args.model, live_model=args.live_model,
-        device=args.device,
+        passthrough=args.passthrough, engine=args.engine, model=model, live_model=live_model,
+        device=args.device, beam=beam, partials=partials, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
         sink=sink, source=pulse.resolve_source(args.source),
         output_device=args.output_device, input_device=args.input_device,
-        duplex=args.duplex, end_ms=args.pause_ms,
+        duplex=args.duplex, end_ms=pause,
         hear=pulse.resolve_source(args.hear), hear_key=_key(args.hear_key) if args.hear_key else None,
     )
 
@@ -71,6 +76,22 @@ def _translator(args):
 def cmd_listen(args):
     from . import ui_cli
     ui_cli.run(_translator(args), show=args.show)
+
+
+def cmd_test(args):
+    from . import ui_cli
+    from .core import send_command
+    try:
+        reply = json.loads(send_command("test"))
+    except RuntimeError:
+        pass  # nothing running: start our own test session below
+    else:
+        state = "ON" if reply["test"] else "OFF"
+        say_line(f"[yellow]⚙ test mode {state} in the binharic that's already running[/] "
+                 "[dim](results show in its window, or: journalctl --user -u binharic -f)[/]")
+        return
+    args.test_mode = True
+    ui_cli.run(_translator(args), show="text", test=True)
 
 
 def cmd_tui(args):
@@ -169,7 +190,8 @@ def cmd_decode(args):
                 style = "yellow" if m.locked else "bold green"
                 say_line(f"[{style}]▼ [{tag}] {m.display()}[/]", f"<< [{tag}] {m.display()}")
     except (KeyboardInterrupt, EOFError):
-        pass
+        for m in dec.flush():
+            print(m.display())
     finally:
         mic.close()
 
@@ -295,6 +317,8 @@ def _run_options(p, inherit: bool = False):
     g.add_argument("--live-model", default="base.en",
                    help="faster whisper model for live words / interim text (default base.en)")
     g.add_argument("--device", default="auto", help="whisper compute device: auto, cpu, cuda")
+    g.add_argument("--fast", action="store_true",
+                   help="lowest latency: base.en only, greedy decoding, 450 ms pause, no live transcript")
 
     g = p.add_argument_group("audio routing")
     g.add_argument("--sink", default="auto",
@@ -326,6 +350,12 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--show", choices=["text", "hex", "binary"], default="text",
                            help="what to print for each sent message")
         s.set_defaults(func=func)
+
+    s = sub.add_parser("test", help="speak and hear the screech back on your speakers, decoded and timed")
+    _run_options(s, inherit=True)
+    s.add_argument("--air", action="store_true",
+                   help="also decode what the mic hears from your speakers (needs speakers, not headphones)")
+    s.set_defaults(func=cmd_test)
 
     for name, cmd, text in [("toggle", "toggle", "flip the running layer ON/OFF"),
                             ("on", "on", "turn it ON"), ("off", "off", "turn it OFF"),

@@ -60,6 +60,13 @@ class Engine:
     def feed(self, audio: np.ndarray, want_hypothesis: bool) -> str | None: ...
     def finish(self, fast: bool = False) -> str: ...
 
+    def peek(self, fast: bool = False) -> str | None:
+        """Transcribe what we have *without* ending the utterance (None = unsupported)."""
+        return None
+
+    def discard(self) -> None:
+        self.finish()
+
 
 class WhisperEngine(Engine):
     name = "whisper"
@@ -72,8 +79,10 @@ class WhisperEngine(Engine):
         if compute_type == "auto":
             compute_type = "int8" if device in ("auto", "cpu") else "float16"
 
+        threads = max(1, min(os.cpu_count() or 4, 16))  # CTranslate2 defaults to 4
+
         def load(name):
-            return WhisperModel(name, device=device, compute_type=compute_type,
+            return WhisperModel(name, device=device, compute_type=compute_type, cpu_threads=threads,
                                 download_root=str(data_dir() / "whisper"))
 
         self.model = load(model)
@@ -123,13 +132,20 @@ class WhisperEngine(Engine):
         return text
 
     def finish(self, fast: bool = False) -> str:
+        text = self.peek(fast) or ""
+        self._buf = []
+        return text
+
+    def peek(self, fast: bool = False) -> str | None:
         if not self._buf:
             return ""
         audio = np.concatenate(self._buf)
-        self._buf = []
         if len(audio) < STT_SR * 0.25:
             return ""
         return self._run(audio, beam=self.beam_size, fast=fast)
+
+    def discard(self) -> None:
+        self._buf = []
 
 
 class VoskEngine(Engine):
@@ -185,11 +201,11 @@ def have_whisper() -> bool:
 
 
 def make_engine(name: str = "auto", model: str | None = None, device: str = "auto",
-                live_model: str | None = DEFAULT_WHISPER_LIVE) -> Engine:
+                live_model: str | None = DEFAULT_WHISPER_LIVE, beam: int = 5) -> Engine:
     if name == "auto":
         name = "whisper" if have_whisper() else "vosk"
     if name == "whisper":
-        return WhisperEngine(model or DEFAULT_WHISPER, device=device, live_model=live_model)
+        return WhisperEngine(model or DEFAULT_WHISPER, device=device, live_model=live_model, beam_size=beam)
     if name == "vosk":
         return VoskEngine(model)
     raise ValueError(f"unknown engine {name!r}")
@@ -254,6 +270,7 @@ class Transcriber:
     on_partial: Callable[[str], None] = lambda t: None
     on_send: Callable[[str, bool], None] = lambda t, f: None
     end_ms: int = 700
+    partials: bool = True  # interim transcripts in phrase mode (display only; costs latency on CPU)
     max_utterance_s: float = 25.0  # Whisper sees at most 30 s at once
     vad: EnergyVAD = field(init=False)
 
@@ -263,6 +280,11 @@ class Transcriber:
         self._committed = 0
         self._last_hyp = ""
         self._speech_started = 0.0
+        self._paused = False
+        self._spec: str | None = None   # speculative final made during a pause
+        self._spec_ms = 0.0
+        self.last_stt_ms = 0.0          # recognition time the last phrase waited on
+        self.last_speculative = False
 
     @property
     def level(self) -> float:
@@ -274,14 +296,16 @@ class Transcriber:
 
     def reset(self) -> None:
         if self.vad.speaking:
-            self.engine.finish()
+            self.engine.discard()
             self.on_speech(False)
+        self._spec, self._paused = None, False
         self.vad = EnergyVAD(STT_SR, end_ms=self.end_ms)
 
     def feed(self, audio16: np.ndarray) -> None:
         for ev in self.vad.feed(audio16):
             if ev.kind == "start":
                 self._prev, self._committed, self._last_hyp = [], 0, ""
+                self._spec, self._paused = None, False
                 self._speech_started = time.monotonic()
                 self.engine.begin()
                 self.on_speech(True)
@@ -293,11 +317,21 @@ class Transcriber:
                     self._end(still_speaking=True)
                     self._speech_started = time.monotonic()
                     self.engine.begin()
+            elif ev.kind == "pause":
+                # you may be done: start the final pass now, while the VAD
+                # waits out the rest of the pause
+                self._paused = True
+                t = time.monotonic()
+                self._spec = self.engine.peek(fast=self.send_mode == LIVE)
+                self._spec_ms = (time.monotonic() - t) * 1000
+            elif ev.kind == "resume":
+                self._paused, self._spec = False, None
             else:
                 self._end()
 
     def _push(self, audio: np.ndarray) -> None:
-        hyp = self.engine.feed(audio, want_hypothesis=True)
+        want = not self._paused and (self.send_mode == LIVE or self.partials)
+        hyp = self.engine.feed(audio, want_hypothesis=want)
         if hyp is None:
             return
         if hyp != self._last_hyp:
@@ -315,8 +349,17 @@ class Transcriber:
     def _end(self, still_speaking: bool = False) -> None:
         if not still_speaking:
             self.on_speech(False)
-        # live mode already sent most words: finish quickly with the fast model
-        text = self.engine.finish(fast=self.send_mode == LIVE)
+        if self._spec is not None and not still_speaking:
+            # nothing but silence since the speculative pass: it is the answer
+            text = self._spec
+            self.engine.discard()
+            self.last_stt_ms, self.last_speculative = self._spec_ms, True
+        else:
+            # live mode already sent most words: finish quickly with the fast model
+            t = time.monotonic()
+            text = self.engine.finish(fast=self.send_mode == LIVE)
+            self.last_stt_ms, self.last_speculative = (time.monotonic() - t) * 1000, False
+        self._spec, self._paused = None, False
         words = _words(text)
         if self.send_mode == LIVE:
             # the final, more careful pass may reword things; send only what

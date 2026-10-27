@@ -60,6 +60,10 @@ class Settings:
     end_ms: int = 700           # silence that ends a phrase
     hear: str | None = None     # source to decode incoming binharic from
     hear_key: str | None = None
+    beam: int = 5               # whisper beam size for the final pass (1 = fastest)
+    partials: bool = True       # show what you're saying while you say it (phrase mode)
+    test: bool = False          # test mode: screech to your speakers, decode it back, time it
+    test_air: bool = False      # ...and also decode what the mic hears (speaker -> mic)
     control_socket: bool = True
     notify: bool = True         # desktop popups when toggled by hotkey
 
@@ -129,6 +133,10 @@ class Translator:
         self._hear_in: Input | None = None
         self._sock: socket.socket | None = None
         self._warned_half = False
+        self._local_out: Output | None = None
+        self._air_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=600)
+        self._mute_until = 0.0
+        self._last_arrival = 0.0
 
     # -- events -----------------------------------------------------------
     def subscribe(self, fn: Listener) -> None:
@@ -156,6 +164,8 @@ class Translator:
 
     @property
     def full_duplex(self) -> bool:
+        if self.s.test:
+            return False  # test mode screeches on your speakers, which the mic can hear
         if self.s.duplex == "auto":
             return bool(self.s.sink)  # a virtual sink can't leak back into the mic
         return self.s.duplex == "full"
@@ -206,6 +216,17 @@ class Translator:
         self.log("key set" if key else "key cleared: anyone with the decoder can read you")
         self._changed()
 
+    def set_test(self, on: bool, air: bool | None = None) -> None:
+        self.s.test = on
+        if air is not None:
+            self.s.test_air = air
+        if on:
+            self.log("TEST MODE: say something. The screech plays on your speakers "
+                     "(not the Binharic Mic) and is decoded back to check it")
+        else:
+            self.log("test mode off")
+        self._changed()
+
     def set_passthrough(self, on: bool) -> None:
         self.s.passthrough = on
         self._changed()
@@ -230,8 +251,9 @@ class Translator:
         if self.s.control_socket:
             self._start_control()  # first, so a second copy fails before touching audio
         self._out = Output(SR, sink=self.s.sink, device=self.s.output_device, blocksize=BLOCK)
-        self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 5)
+        self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2)
         self._spawn(self._out_loop, "out")
+        self._spawn(self._air_loop, "air")
         self._spawn(self._mic_loop, "mic")
         self._spawn(self._stt_loop, "stt")
         if self.s.hear:
@@ -248,10 +270,11 @@ class Translator:
                 pass
         for t in self._threads:
             t.join(timeout=2)
-        try:
-            self._out and self._out.close()
-        except Exception:
-            pass
+        for out in {id(o): o for o in (self._out, self._local_out) if o}.values():
+            try:
+                out.close()
+            except Exception:
+                pass
         if self._sock:
             self._sock.close()
             try:
@@ -286,21 +309,28 @@ class Translator:
                 block = self._mic.read()
             except EOFError:
                 break
-            if self.screeching.is_set() and not self.full_duplex:
+            now = time.monotonic()
+            if (self.screeching.is_set() or now < self._mute_until) and not self.full_duplex:
+                if self.s.test and self.s.test_air:
+                    try:
+                        self._air_q.put_nowait(block)
+                    except queue.Full:
+                        pass
                 block = np.zeros_like(block)  # keep timing, drop our own echo
             try:
-                self._mic_q.put_nowait(block)
+                self._mic_q.put_nowait((block, now))
             except queue.Full:
                 self._mic_q.get_nowait()
-                self._mic_q.put_nowait(block)
+                self._mic_q.put_nowait((block, now))
 
     def _stt_loop(self):
         self.log("loading speech recognition…")
-        engine = make_engine(self.s.engine, self.s.model, self.s.device, self.s.live_model)
+        engine = make_engine(self.s.engine, self.s.model, self.s.device, self.s.live_model, self.s.beam)
         self.engine_name = f"{engine.name} · {engine.label}" if engine.label != engine.name else engine.name
         self.transcriber = Transcriber(engine, self.s.send_mode, on_speech=self._on_speech,
                                        on_partial=lambda t: self.emit("partial", text=t),
-                                       on_send=self._queue_text, end_ms=self.s.end_ms)
+                                       on_send=self._on_send, end_ms=self.s.end_ms,
+                                       partials=self.s.partials)
         dec = Decimator(SR // STT_SR)
         while not self._mic_q.empty():  # don't transcribe what was said while loading
             self._mic_q.get_nowait()
@@ -319,8 +349,10 @@ class Translator:
                     blocks.append(self._mic_q.get_nowait())
                 except queue.Empty:
                     break
+            self._last_arrival = blocks[-1][1]
+            blocks = [b for b, _ in blocks]
             audio = np.concatenate(blocks)
-            if not self.s.enabled:
+            if not (self.s.enabled or self.s.test):
                 if self.s.passthrough:
                     for b in blocks:
                         try:
@@ -342,28 +374,49 @@ class Translator:
         self.speaking = on
         self.emit("speech", speaking=on)
 
-    def _queue_text(self, text: str, final: bool, force: bool = False):
-        if not text or (not self.s.enabled and not force):
+    def _on_send(self, text: str, final: bool):
+        meta = {}
+        tr = self.transcriber
+        if final and tr is not None:
+            # when you actually stopped talking, from mic timestamps + VAD's quiet count
+            meta = dict(stopped_at=self._last_arrival - tr.vad.since_voice / STT_SR,
+                        stt_ms=tr.last_stt_ms, speculative=tr.last_speculative)
+        meta["heard_at"] = time.monotonic()
+        self._queue_text(text, final, meta=meta)
+
+    def _queue_text(self, text: str, final: bool, force: bool = False, meta: dict | None = None):
+        if not text or (not (self.s.enabled or self.s.test) and not force):
             return
         with self._pending_lock:
-            self._pending.append(text)
+            self._pending.append((text, meta or {}))
         self.emit("queued", text=text, final=final)
 
-    def _take_pending(self) -> str | None:
+    def _take_pending(self) -> tuple[str, dict] | None:
         with self._pending_lock:
             if not self._pending:
                 return None
-            text = " ".join(self._pending)
+            text = " ".join(t for t, _ in self._pending)
+            meta = {}
+            for _, m in self._pending:
+                meta.update(m)
             self._pending.clear()
-        return text
+        return text, meta
+
+    def _target(self) -> Output:
+        """Where the screech goes: the Binharic Mic, or your speakers in test mode."""
+        if not self.s.test or not self.s.sink:
+            return self._out
+        if self._local_out is None:
+            self._local_out = Output(SR, sink=None, device=self.s.output_device, blocksize=BLOCK)
+        return self._local_out
 
     def _out_loop(self):
         out = self._out
         silence = np.zeros(BLOCK, dtype=np.float32)
         while not self._stop.is_set():
-            text = self._take_pending()
-            if text:
-                self._play_text(out, text)
+            item = self._take_pending()
+            if item:
+                self._play_text(self._target(), *item)
                 continue
             block = None
             if self.s.passthrough and not self.s.enabled:
@@ -376,7 +429,8 @@ class Translator:
                     self._voice_q.get_nowait()
             out.write(block if block is not None else silence)
 
-    def _play_text(self, out: Output, text: str):
+    def _play_text(self, out: Output, text: str, meta: dict | None = None):
+        meta = meta or {}
         chunks, cur = [], b""
         for word in text.split(" "):
             w = word.encode("utf-8")
@@ -389,20 +443,73 @@ class Translator:
         self._abort.clear()
         self.screeching.set()
         self._changed()
+        s = self.s
+        lead = modem.lead_in(SR, s.volume)
         try:
-            for chunk in chunks:
-                audio = modem.encode_text(chunk, self.s.mode, key=self.s.key, sr=SR,
-                                          speed=self.s.speed, volume=self.s.volume)
-                self.emit("sent", text=chunk, hex=codec.to_hex(chunk), binary=codec.to_binary(chunk),
-                          seconds=len(audio) / SR, mode=self.s.mode)
+            for n, chunk in enumerate(chunks):
+                # the sync chirp is the same for every message: start it right away
+                # and synthesise the body while it plays
+                result = {}
+
+                def synth(chunk=chunk):
+                    t = time.monotonic()
+                    result["body"] = modem.encode_body(chunk, s.mode, key=s.key, sr=SR,
+                                                       speed=s.speed, volume=s.volume)
+                    result["ms"] = (time.monotonic() - t) * 1000
+
+                worker = threading.Thread(target=synth, daemon=True)
+                worker.start()
+                first_sound = time.monotonic()
+                for i in range(0, len(lead), BLOCK):  # 180 ms of chirp covers the synthesis
+                    out.write(lead[i:i + BLOCK])
+                worker.join()
+                body, synth_ms = result["body"], result["ms"]
+                info = dict(text=chunk, hex=codec.to_hex(chunk), binary=codec.to_binary(chunk),
+                            seconds=(len(lead) + len(body)) / SR, mode=s.mode, synth_ms=synth_ms,
+                            test=s.test)
+                if n == 0 and "stopped_at" in meta:
+                    info.update(latency_ms=(first_sound - meta["stopped_at"]) * 1000,
+                                stt_ms=meta["stt_ms"], speculative=meta["speculative"])
+                self.emit("sent", **info)
+                audio = body
+                if s.test:
+                    self._verify(chunk, np.concatenate([lead, body]), s.mode, s.key, s.speed)
                 for i in range(0, len(audio), BLOCK):
                     if self._abort.is_set() or self._stop.is_set():
                         self.log("screech cut off")
                         return
                     out.write(audio[i:i + BLOCK])
         finally:
+            self._mute_until = time.monotonic() + 0.4  # speaker/room tail
             self.screeching.clear()
             self._changed()
+
+    def _verify(self, text, audio, mode, key, speed):
+        def run():
+            t = time.monotonic()
+            got = modem.decode_audio(audio, SR, mode, key=key, speed=speed)
+            ms = (time.monotonic() - t) * 1000
+            decoded = got[0].display() if got else None
+            self.emit("verify", via="digital", sent=text, decoded=decoded, ok=decoded == text, decode_ms=ms)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _air_loop(self):
+        """Test mode: decode the screech as the mic heard it from the speakers."""
+        dec = None
+        while not self._stop.is_set():
+            try:
+                block = self._air_q.get(timeout=0.3)
+            except queue.Empty:
+                if dec is not None and not self.screeching.is_set() and time.monotonic() > self._mute_until:
+                    for m in dec.flush():  # the tail of the screech may still be unscanned
+                        self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked,
+                                  decode_ms=0.0)
+                    dec = None  # this attempt is over; start clean for the next screech
+                continue
+            if dec is None:
+                dec = modem.StreamDecoder(SR, "auto", key=self.s.key, speed=self.s.speed)
+            for m in dec.feed(block):
+                self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
 
     def _hear_loop(self):
         self._hear_in = Input(SR, source=self.s.hear, blocksize=BLOCK * 5)
@@ -466,6 +573,8 @@ class Translator:
             self.set_mode(arg)
         elif cmd == "passthrough":
             self.set_passthrough(arg != "off" if arg else not self.s.passthrough)
+        elif cmd == "test":
+            self.set_test(arg != "off" if arg else not self.s.test)
         elif cmd == "say":
             self.say(arg)
         elif cmd == "quit":

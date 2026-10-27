@@ -143,22 +143,44 @@ def _screech(symbols: list[int], spec: ModeSpec, sr: int, rng: np.random.Generat
     return sig * env
 
 
-def modulate(frame: bytes, spec: ModeSpec, sr: int = DEFAULT_SR, volume: float = 0.8,
-             seed: int | None = None) -> np.ndarray:
+_LEAD_IN: dict[int, np.ndarray] = {}
+
+
+def lead_in(sr: int = DEFAULT_SR, volume: float = 0.8) -> np.ndarray:
+    """Sync chirp + gap. Identical for every message, so it can start playing
+    before the rest of the message has been synthesised."""
+    if sr not in _LEAD_IN:
+        _LEAD_IN[sr] = np.concatenate([preamble(sr), np.zeros(int(PREAMBLE_GAP * sr), np.float32)])
+    return _LEAD_IN[sr] * np.float32(volume)
+
+
+def modulate_body(frame: bytes, spec: ModeSpec, sr: int = DEFAULT_SR, volume: float = 0.8,
+                  seed: int | None = None) -> np.ndarray:
+    """Everything after ``lead_in``: the data tones plus a short tail."""
     symbols = bytes_to_symbols(frame, spec.bits)
     if spec.screech:
         body = _screech(symbols, spec, sr, np.random.default_rng(seed))
     else:
         body = _beeps(symbols, spec, sr)
-    sig = np.concatenate([preamble(sr), np.zeros(int(PREAMBLE_GAP * sr)), body, np.zeros(int(0.05 * sr))])
-    peak = float(np.max(np.abs(sig))) or 1.0
-    return (sig / peak * volume).astype(np.float32)
+    peak = float(np.max(np.abs(body))) if len(body) else 1.0
+    return np.concatenate([body / (peak or 1.0) * volume, np.zeros(int(0.05 * sr))]).astype(np.float32)
+
+
+def modulate(frame: bytes, spec: ModeSpec, sr: int = DEFAULT_SR, volume: float = 0.8,
+             seed: int | None = None) -> np.ndarray:
+    return np.concatenate([lead_in(sr, volume), modulate_body(frame, spec, sr, volume, seed)])
 
 
 def encode_text(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,
                 speed: float = 1.0, volume: float = 0.8) -> np.ndarray:
     spec = get_mode(mode, speed)
     return modulate(codec.build_frame(text, spec.id, key), spec, sr, volume)
+
+
+def encode_body(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,
+                speed: float = 1.0, volume: float = 0.8) -> np.ndarray:
+    spec = get_mode(mode, speed)
+    return modulate_body(codec.build_frame(text, spec.id, key), spec, sr, volume)
 
 
 # --------------------------------------------------------------------------
@@ -295,6 +317,10 @@ class StreamDecoder:
         if len(self.buf) < self._wait_until or len(self.buf) - self._last_scan < self.sr // 4:
             return []
         return self._scan()
+
+    def flush(self) -> list[codec.Message]:
+        """Scan whatever is buffered now (call when the input pauses or ends)."""
+        return self._scan() if len(self.buf) else []
 
     def _scan(self) -> list[codec.Message]:
         out: list[codec.Message] = []

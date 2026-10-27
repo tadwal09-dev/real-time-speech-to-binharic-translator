@@ -121,6 +121,12 @@ def run(tr: Translator) -> None:
                    activebackground=PANEL, activeforeground=FG, font=ui, highlightthickness=0
                    ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+    test_var = tk.BooleanVar(value=tr.s.test)
+    tk.Checkbutton(panel, text="Test mode: play the screech on my speakers and decode it back (timed)",
+                   variable=test_var, command=lambda: tr.set_test(test_var.get()), bg=PANEL, fg=AMBER,
+                   selectcolor=BG, activebackground=PANEL, activeforeground=AMBER, font=ui,
+                   highlightthickness=0).grid(row=6, column=0, columnspan=2, sticky="w")
+
     # -- meter + live text --------------------------------------------------
     live = tk.Frame(root, bg=BG)
     live.pack(fill="x", padx=16, pady=(12, 4))
@@ -171,7 +177,7 @@ def run(tr: Translator) -> None:
     tk.Button(say, text="Screech it", command=do_say, bg=RED, fg="white", bd=0, activebackground=RED_HI,
               font=(ui[0], 10, "bold"), padx=14, cursor="hand2").pack(side="left", padx=(8, 0), ipady=4)
 
-    hint = label(root, "Space: on/off   ·   Ctrl+L: after finish ⇄ as I talk   ·   "
+    hint = label(root, "Space: on/off  ·  Ctrl+L: finish ⇄ live  ·  Ctrl+T: test  ·  "
                        "hotkeys: binharic toggle / binharic send toggle", bg=BG)
     hint.pack(pady=(0, 10))
 
@@ -181,6 +187,7 @@ def run(tr: Translator) -> None:
 
     root.bind("<space>", lambda e: None if typing() else tr.toggle())
     root.bind("<Control-l>", lambda e: tr.set_send_mode("toggle"))
+    root.bind("<Control-t>", lambda e: tr.set_test(not tr.s.test))
     root.bind("<Escape>", lambda e: root.focus())
 
     # -- refresh ------------------------------------------------------------
@@ -193,6 +200,7 @@ def run(tr: Translator) -> None:
         send_var.set(s.send_mode)
         mode_var.set(s.mode)
         pass_var.set(s.passthrough)
+        test_var.set(s.test)
         engine_lbl.configure(text=tr.engine_name if tr.ready else "loading speech model…")
 
     def poll():
@@ -207,7 +215,15 @@ def run(tr: Translator) -> None:
             elif kind == "partial":
                 partial_lbl.configure(text=ev["text"])
             elif kind == "sent":
-                add_log("sent", ev["text"], ev["hex"])
+                extra = ev["hex"]
+                if ev.get("test") and "latency_ms" in ev:
+                    extra = (f"⏱ {ev['latency_ms']:.0f} ms after you stopped · recognition "
+                             f"{ev['stt_ms']:.0f} ms · synth {ev['synth_ms']:.0f} ms")
+                add_log("sent", ev["text"], extra)
+            elif kind == "verify":
+                via = "over the air" if ev["via"] == "air" else "round trip"
+                add_log("recv" if ev["ok"] else "error",
+                        f"{'✔' if ev['ok'] else '✖'} {via} {'OK' if ev['ok'] else 'FAILED'}: {ev['decoded']}")
             elif kind == "received":
                 add_log("locked" if ev["locked"] else "recv", ev["text"])
             elif kind == "log":
@@ -223,7 +239,10 @@ def run(tr: Translator) -> None:
         lvl = min(1.0, (state["level"] * 12) ** 0.6)
         meter.delete("all")
         meter.create_rectangle(0, 0, int(w * lvl), 14, fill=GREEN if tr.speaking else "#4a6b78", width=0)
-        if not tr.s.enabled:
+        if tr.s.test and not tr.screeching.is_set():
+            status_lbl.configure(text="TEST MODE · say something" + (" · listening…" if tr.speaking else ""),
+                                 fg=AMBER)
+        elif not tr.s.enabled:
             status_lbl.configure(text="voice passing through" if tr.s.passthrough else "off: nothing is sent",
                                  fg=DIM)
         elif tr.screeching.is_set():
