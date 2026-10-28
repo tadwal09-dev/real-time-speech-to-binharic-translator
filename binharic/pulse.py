@@ -65,11 +65,24 @@ def mic_up() -> None:
 
 
 def mic_down() -> int:
+    """Remove the virtual mic. The remap source goes first: unloading the sink
+    first takes the source with it (on PulseAudio), and unloading that then fails."""
+    def ours() -> list[str]:
+        mods = []
+        for line in _pactl("list", "short", "modules").splitlines():
+            if f"source_name={MIC}" in line:
+                mods.insert(0, line.split("\t")[0])
+            elif f"sink_name={SINK}" in line:
+                mods.append(line.split("\t")[0])
+        return mods
     n = 0
-    for line in _pactl("list", "short", "modules").splitlines():
-        if f"sink_name={SINK}" in line or f"source_name={MIC}" in line:
-            _pactl("unload-module", line.split("\t")[0])
+    for mod in ours():
+        try:
+            _pactl("unload-module", mod)
             n += 1
+        except subprocess.CalledProcessError:
+            if mod in ours():
+                raise  # still there: a real failure
     return n
 
 

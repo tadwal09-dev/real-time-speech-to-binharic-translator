@@ -106,7 +106,7 @@ def _settings(args):
         sink=sink, source=pulse.resolve_source(args.source) or (cfg.get("source") if not args.input_device else None),
         output_device=args.output_device, input_device=args.input_device or cfg.get("input_device"),
         duplex=args.duplex, end_ms=pause,
-        hear=pulse.resolve_source(args.hear), hear_key=_key(args.hear_key) if args.hear_key else None,
+        hear=pulse.resolve_source(args.hear) if pulse.available() else args.hear, hear_key=_key(args.hear_key) if args.hear_key else None,
     )
 
 
@@ -127,10 +127,11 @@ def _translator(args):
 def _run_ui(run, tr, **kw):
     # `systemctl --user stop`, closing the terminal, `kill`: shut down cleanly
     # (close the audio, remove the control socket) instead of just dying
-    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):  # no SIGHUP on Windows
-        if sig is None:
-            continue
-        signal.signal(sig, lambda *_: tr.request_stop())
+    # Windows: Ctrl+Break, or closing the console window, arrives as SIGBREAK
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, lambda *_: tr.request_stop())
     try:
         run(tr, **kw)
     except KeyboardInterrupt:
@@ -290,6 +291,9 @@ def cmd_say(args):
     from .audio import Output
     sink = pulse.resolve_sink(args.sink)
     device = args.output_device
+    if device and not sink:
+        from . import pa
+        device = pa.resolve(device, "output")  # a name: Windows lists each device several times
     if sink is None and not device and pulse.available():
         sink = pulse.real_sink()  # PipeWire directly: PortAudio over ALSA is unreliable there
     elif sink is None and not device and args.sink == "auto":
@@ -330,9 +334,13 @@ def cmd_decode(args):
         source = pulse.real_source()
     elif source:
         pulse.check_device(source, "sources")
-    mic = Input(SR, source=source, device=args.input_device)
+    device = None
+    if not source and args.input_device:
+        from . import pa
+        device = pa.resolve(args.input_device, "input")
+    mic = Input(SR, source=source, device=device)
     dec = modem.StreamDecoder(SR, args.mode, key=key, speed=args.speed, threshold=args.threshold)
-    where = pulse.describe(source, "sources") if source else "the default mic"
+    where = pulse.describe(source, "sources") if source else args.input_device or "the default mic"
     say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
 
     def show(m):
@@ -371,6 +379,9 @@ def cmd_text(args):
 
 def cmd_mic(args):
     from . import pulse
+    from .osinfo import WINDOWS
+    if WINDOWS or (ISH and not shutil.which("pactl")):
+        return _mic_windows(args)
     try:
         if args.action == "up":
             pulse.mic_up()
@@ -383,6 +394,26 @@ def cmd_mic(args):
             say_line("[green]✔ Binharic Mic present[/]" if ok else "[yellow]✖ not set up: binharic mic up[/]")
     except Exception as e:
         sys.exit(f"pactl failed: {e}")
+
+
+def _mic_windows(args):
+    """Windows has no PipeWire to make a virtual mic: VB-Audio's free Virtual
+    Cable is one. binharic plays into "CABLE Input"; Discord records "CABLE Output"."""
+    from . import pa
+    if ISH:
+        sys.exit("iSH has no virtual microphone: binharic writes sound files there (see `binharic ish`)")
+    cable = pa.find_cable() if pa.available() else None
+    if cable is not None:
+        say_line("[green]✔ VB-Audio Virtual Cable is installed[/]: binharic sends into 'CABLE Input'. "
+                 "In Discord/OBS pick [bold]CABLE Output[/] as your microphone.")
+        if args.action == "down":
+            say_line("  (to remove it, uninstall 'VB-Audio Virtual Cable' in Settings -> Apps)")
+        return
+    say_line(f"[yellow]✖ VB-Audio Virtual Cable isn't installed.[/] On Windows it is the Binharic Mic: download "
+             f"it from {pa.CABLE_URL}, run VBCABLE_Setup_x64.exe as administrator, reboot, then in Discord "
+             "pick 'CABLE Output' as your mic.")
+    if args.action == "up":
+        sys.exit(1)
 
 
 def cmd_devices(args):

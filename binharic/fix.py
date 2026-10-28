@@ -336,8 +336,7 @@ class Fixer:
         from . import pa
         import sounddevice as sd
         sr = 48000
-        cable_in = pa.find_cable()
-        cable_out = next((d["index"] for d in pa.devices("input") if pa._is_cable(d["name"])), None)
+        cable_in, cable_out = pa.find_cable(), pa.find_cable_output()
         if cable_out is None:
             return
         text = "binharic self test"

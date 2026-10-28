@@ -153,6 +153,7 @@ class Translator:
         self._on_pulse = False
         self.virtual = False          # the screech goes to a virtual mic (PipeWire's or VB-Cable)
         self._speaker_device = None   # PortAudio device for your speakers (test mode)
+        self._hear_device = None      # PortAudio device --hear decodes (no PipeWire)
         self.speakers_label = "default output"
         self.mic_label = "default input"
         self._stopped_once = False
@@ -430,6 +431,8 @@ class Translator:
         """Windows (or Linux without PipeWire): PortAudio devices by name, and
         VB-Audio's Virtual Cable as the virtual mic."""
         from . import pa
+        if self.s.hear not in (None, ""):
+            self._hear_device = self._portaudio_hear(self.s.hear)
         self.virtual = bool(self.s.sink) and self.s.sink != "default"
         if self.virtual:
             return  # an explicitly named virtual device (tests, or set up by hand)
@@ -446,6 +449,20 @@ class Translator:
             elif osinfo.WINDOWS:
                 self.log("no virtual cable found: the screech plays on your speakers. For Discord, install "
                          f"VB-Audio Virtual Cable ({pa.CABLE_URL}) and pick 'CABLE Output' as your mic", "warn")
+
+    @staticmethod
+    def _portaudio_hear(name: str):
+        """--hear without PipeWire: an input device. 'speakers' means Windows' own
+        recording of what you hear ("Stereo Mix"), when the sound card has one."""
+        from . import pa
+        if name in ("speakers", "monitor"):
+            for d in pa.devices("input"):
+                if any(w in d["name"].lower() for w in ("stereo mix", "what u hear", "loopback")):
+                    return d["index"]
+            raise RuntimeError("--hear speakers needs 'Stereo Mix': enable it in Sound settings -> Recording "
+                               "(show disabled devices), or give the input device the screech arrives on, "
+                               "e.g. --hear \"CABLE Output\" (see `binharic devices`)")
+        return pa.resolve(name, "input")
 
     def _recreate_virtual_mic(self) -> None:
         """After a sound-server restart the virtual devices are gone: rebuild
@@ -703,7 +720,9 @@ class Translator:
                 self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
 
     def _hear_loop(self):
-        self._hear_in = Input(SR, source=self.s.hear, blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
+        self._hear_in = Input(SR, source=self.s.hear if self._on_pulse else None,
+                              device=None if self._on_pulse else self._hear_device,
+                              blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
         dec = modem.StreamDecoder(SR, "auto", key=self.s.hear_key or self.s.key, speed=self.s.speed)
         self.log(f"decoding incoming binharic from {self.s.hear}")
         while not self._stop.is_set():

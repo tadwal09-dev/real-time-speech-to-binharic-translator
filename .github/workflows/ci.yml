@@ -1,0 +1,110 @@
+name: ci
+on:
+  push:
+    branches: [main, claude/happy-gates-btt1f9]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: run the end-to-end suite this many times in a row (all must pass)
+        default: "1"
+
+env:
+  REPEAT: ${{ inputs.repeat || '1' }}
+
+jobs:
+  unit:
+    name: unit · ${{ matrix.os }} · py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12", "3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}"}
+      - run: pip install ".[test]"
+      - run: python -m pytest -q tests
+
+  e2e-windows:
+    name: e2e · Windows (install.ps1, VB-Cable)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\binharic\whisper
+          key: models-windows-v1
+      - run: .github/scripts/windows-audio.ps1
+        shell: pwsh
+      - run: .github/scripts/windows-e2e.ps1 --repeat $env:REPEAT --artifacts e2e-artifacts
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: e2e-windows, path: e2e-artifacts}
+
+  e2e-arch:
+    name: e2e · Arch Linux (install.sh, PipeWire)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: archlinux:latest
+    steps:
+      - name: system packages (what an Arch desktop already has)
+        run: |
+          pacman -Syu --noconfirm --needed git sudo pipewire pipewire-pulse wireplumber dbus ffmpeg \
+            xorg-server-xvfb xorg-xauth imagemagick ttf-dejavu
+          useradd -m tadwa && echo "tadwa ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tadwa
+          mkdir -p /run/user/1000 && chown tadwa /run/user/1000 && chmod 700 /run/user/1000
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /home/tadwa/.local/share/binharic/whisper
+          key: models-arch-v1
+      - run: chown -R tadwa "$GITHUB_WORKSPACE" /home/tadwa
+      - run: |
+          su tadwa -c "cd '$GITHUB_WORKSPACE' && XDG_RUNTIME_DIR=/run/user/1000 dbus-run-session -- \
+            .github/scripts/arch-e2e.sh --repeat $REPEAT --artifacts e2e-artifacts"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: e2e-arch, path: e2e-artifacts}
+
+  e2e-ubuntu:
+    name: e2e · Ubuntu (pip, PulseAudio)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pulseaudio pulseaudio-utils libportaudio2 ffmpeg xvfb imagemagick
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/binharic/whisper
+          key: models-ubuntu-v1
+      - run: pip install ".[all,test]" pyte
+      - run: xvfb-run -a -s "-screen 0 1280x1024x24" python -m tests.e2e.run --repeat $REPEAT --artifacts e2e-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: e2e-ubuntu, path: e2e-artifacts}
+
+  e2e-ish:
+    name: e2e · iSH stand-in (32-bit Alpine, install-ish.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker run --rm --platform linux/386 -e BINHARIC_ISH=1 -v "$PWD:/src" -w /src i386/alpine:3.20 sh -c '
+            set -e
+            sh install-ish.sh
+            binharic --help >/dev/null
+            BINHARIC_E2E_CMD=binharic ~/.binharic-venv/bin/python -m tests.e2e.run --repeat '"$REPEAT"' --artifacts e2e-artifacts'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: e2e-ish, path: e2e-artifacts}

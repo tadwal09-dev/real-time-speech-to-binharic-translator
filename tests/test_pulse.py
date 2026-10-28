@@ -65,3 +65,24 @@ def test_silent_mic_is_reported(monkeypatch, tmp_path):
         time.sleep(0.1)
     tr.stop()
     assert any(level == "error" and "silent" in t for level, t in logs)
+
+
+def test_mic_down_removes_the_source_before_the_sink(monkeypatch):
+    # regression: unloading the null sink first made PulseAudio drop the remap
+    # source with it, and `binharic mic down` then failed unloading that
+    import subprocess
+    mods = {"6": "module-null-sink\tsink_name=binharic_out", "7": "module-remap-source\tsource_name=binharic_mic"}
+
+    def pactl(*args):
+        if args[:3] == ("list", "short", "modules"):
+            return "".join(f"{k}\t{v}\n" for k, v in mods.items())
+        if args[0] == "unload-module":
+            if args[1] not in mods:
+                raise subprocess.CalledProcessError(1, "pactl")
+            if args[1] == "6":
+                mods.pop("7", None)  # the sink takes its remap source with it
+            mods.pop(args[1])
+            return ""
+        raise AssertionError(args)
+    monkeypatch.setattr(pulse, "_pactl", pactl)
+    assert pulse.mic_down() == 2 and not mods

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -42,6 +43,9 @@ DEFAULT_VOSK = "vosk-model-small-en-us-0.15"
 
 
 def data_dir() -> Path:
+    """Where models (and downloaded GPU libraries) live."""
+    if sys.platform == "win32":  # next to the installer's environment, %LOCALAPPDATA%\binharic
+        return Path(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) / "binharic"
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return Path(base) / "binharic"
 
