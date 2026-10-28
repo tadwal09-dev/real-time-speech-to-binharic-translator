@@ -644,6 +644,9 @@ class Translator:
                 # PipeWire/Pulse: leave the buffer empty while idle, so a new
                 # screech doesn't queue up behind buffered silence
                 time.sleep(0.005)
+            local = self._local_out  # test mode's speakers: keep a PortAudio stream streaming too,
+            if local is not None and local is not out and local.needs_feeding:  # or its next
+                local.write(silence if block is None else np.zeros(len(block), np.float32))  # start glitches
 
     def _play_text(self, out: Output, text: str, meta: dict | None = None):
         meta = meta or {}

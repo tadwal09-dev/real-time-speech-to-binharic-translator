@@ -25,8 +25,11 @@ def run(tr: Translator) -> None:
     root.withdraw()  # stay hidden until we know we can start (else only an error dialog shows)
     root.title("Binharic")
     root.configure(bg=BG)
-    root.minsize(560, 560)
-    root.geometry("680x760")
+    # fit the screen: on a 768-pixel laptop screen (minus the taskbar) a fixed
+    # 760 px hid the "type to screech" row below the bottom edge
+    height = max(480, min(760, root.winfo_screenheight() - 110))
+    root.minsize(560, min(560, height))
+    root.geometry(f"680x{height}+40+20")
     families = set(tkfont.families())
     ui = FONT if "Inter" in families else ("DejaVu Sans", 10)
     mono = MONO if "JetBrains Mono" in families else ("DejaVu Sans Mono", 10)
@@ -193,7 +196,9 @@ def run(tr: Translator) -> None:
         log.see("end")
 
     say = tk.Frame(root, bg=BG)
-    say.pack(fill="x", padx=16, pady=(0, 14))
+    # the bottom rows are packed before the log: Tk gives space in packing order,
+    # so in a short window the log shrinks instead of these vanishing below it
+    say.pack(side="bottom", fill="x", padx=16, pady=(0, 14), before=logf)
     say_var = tk.StringVar()
     say_entry = tk.Entry(say, textvariable=say_var, bg=PANEL, fg=FG, insertbackground=FG, relief="flat",
                          font=ui, highlightthickness=1, highlightbackground=PANEL, highlightcolor=RED)
@@ -210,7 +215,7 @@ def run(tr: Translator) -> None:
 
     hint = label(root, "Space: on/off  ·  Ctrl+L: finish ⇄ live  ·  Ctrl+T: test  ·  "
                        "hotkeys: binharic toggle / binharic send toggle", bg=BG)
-    hint.pack(pady=(0, 10))
+    hint.pack(side="bottom", pady=(0, 10), before=say)
 
     # -- keyboard -----------------------------------------------------------
     def typing():

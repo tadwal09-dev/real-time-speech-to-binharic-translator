@@ -355,3 +355,33 @@ def test_hear_announces_itself_only_once_audio_arrives(monkeypatch):
     time.sleep(0.3)
     tr._stop.set()
     assert any("decoding incoming" in m for m in logs)
+
+
+def test_test_mode_speakers_keep_streaming_between_screeches():
+    # regression (Windows): test mode's speaker stream was only written while
+    # screeching; PortAudio then glitched at the start of the next screech and
+    # mangled its sync chirp, so "over the air" never decoded
+    import threading
+
+    class Feed:
+        needs_feeding, latency = True, 0.0
+
+        def __init__(self):
+            self.samples, self.until = 0, 0.0
+
+        def write(self, x):  # like a blocking stream with a 100 ms buffer
+            self.samples += len(x)
+            now = time.monotonic()
+            self.until = max(self.until, now) + len(x) / 48000
+            time.sleep(max(0.0, self.until - now - 0.1))
+
+        def ensure_alive(self):
+            pass
+    tr = core.Translator(core.Settings(control_socket=False, test=True))
+    tr._out, tr._local_out, tr.virtual = Feed(), Feed(), True
+    t = threading.Thread(target=tr._out_loop, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    tr._stop.set()
+    t.join(2)
+    assert tr._local_out.samples > 48000 * 0.3, tr._local_out.samples

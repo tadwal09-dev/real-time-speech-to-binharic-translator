@@ -206,6 +206,20 @@ def script(win: Window, tr: core.Translator, rig):
     check("[unencrypted]" in win.log_text(), "logged as unencrypted")
     screenshot("gui-sent")
 
+    # everything is visible: inside the window, and the window on the screen
+    # (a 768 px laptop screen minus the taskbar)
+    def visibility():
+        r = win.root
+        r.update_idletasks()
+        bottom = r.winfo_rooty() + r.winfo_height()
+        hidden = [f"{w.winfo_class()} {w.cget('text') if 'text' in w.keys() else ''!r}" for w in walk(r)
+                  if isinstance(w, (tk.Button, tk.Entry, tk.Radiobutton, tk.Checkbutton))
+                  and (w.winfo_height() < 5 or w.winfo_rooty() + w.winfo_height() > bottom)]
+        return hidden, bottom, r.winfo_screenheight()
+    hidden, bottom, screen = win.ui(visibility)
+    check(not hidden, f"controls cut off at the bottom of the window: {hidden}")
+    check(bottom <= screen - 40, f"the window runs off the screen: bottom {bottom} of {screen}")
+
     # close the window like a user
     win.ui(lambda: win.root.tk.call(win.root.protocol("WM_DELETE_WINDOW")))
 
@@ -217,6 +231,7 @@ def main():
     rig = make_rig()
     rig.attach()
     result = {"ok": False}
+    script_thread = [None]
     original = tk.Tk.mainloop
 
     def mainloop(root, *a):
@@ -242,11 +257,14 @@ def main():
                     win.ui(lambda: root.destroy(), 5)
                 except Failed:
                     os._exit(1)
-        threading.Thread(target=run, daemon=True).start()
+        script_thread[0] = threading.Thread(target=run, daemon=True)
+        script_thread[0].start()
         original(root, *a)
 
     tk.Tk.mainloop = mainloop
     fatal = cli._run_ui(ui_gui.run, tr)
+    if script_thread[0] is not None:  # closing the window is the script's last step: let it finish
+        script_thread[0].join(15)
     if fatal:
         print("fatal:", fatal)
     print("ALL OK" if result["ok"] and not fatal else "FAILED", flush=True)

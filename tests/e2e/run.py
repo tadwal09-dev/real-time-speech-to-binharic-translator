@@ -517,6 +517,7 @@ def say_to_the_speakers(ctx):
 def decode_live_from_a_device(ctx):
     lay = Layer(ctx, "decode", ctx.rig.decode_args("vmic") + ["-k", KEY])
     lay.wait_for("listening for binharic", 30)
+    ctx.record("vmic")  # the same audio the decoder gets, saved if this fails
     time.sleep(1)
     ctx.ok("say", "-k", KEY, "--privacy", "decoys", "--decoys", "2", "live decoding")
     lay.wait_for("live decoding", 30)

@@ -302,6 +302,8 @@ def cmd_say(args):
         device = pa.find_cable() if pa.available() else None  # Windows: VB-Cable is the virtual mic
     out = Output(SR, sink=sink, device=device)
     try:
+        if out.needs_feeding:  # PortAudio (Windows): a stream that just started can glitch;
+            out.write(np.zeros(SR // 5, dtype=np.float32))  # let that hit silence, not the sync chirp
         out.write(audio)
         out.write(np.zeros(SR // 4, dtype=np.float32))
     finally:

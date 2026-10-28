@@ -287,7 +287,11 @@ class WindowsRig:
 
     def play(self, audio: np.ndarray, where: str = "mic") -> None:
         dev = {"mic": self.mic_in, "vmic": self.vmic_in, "speakers": self.mic_in}[where]
-        self.sd.play(np.asarray(audio, np.float32).reshape(-1, 1), samplerate=SR, device=dev, blocking=True)
+        # MME starts and stops a fresh stream sloppily (the first and last ~0.1 s can be
+        # lost): pad with silence so what we "say" arrives whole
+        pad = np.zeros(SR // 4, np.float32)
+        audio = np.concatenate([pad, np.asarray(audio, np.float32), pad, pad])
+        self.sd.play(audio.reshape(-1, 1), samplerate=SR, device=dev, blocking=True)
 
     def record(self, where: str = "vmic") -> "WindowsRecorder":
         return WindowsRecorder(self.sd, {"vmic": self.vmic_out, "mic": self.mic_out, "speakers": self.mic_out}[where])
