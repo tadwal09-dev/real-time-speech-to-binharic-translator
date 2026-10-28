@@ -83,8 +83,12 @@ fi
 step "creating the Binharic Mic"
 "$BIN" mic up || echo "!! couldn't create it now - is PipeWire running? try later: binharic mic up"
 
-step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
-if [[ -n "${BINHARIC_NO_GPU:-}" ]]; then "$BIN" fix --no-gpu || true; else "$BIN" fix || true; fi
+if [[ -n "${BINHARIC_UPDATE:-}" ]]; then
+  :  # `binharic update`: the setup was already checked when it was installed
+else
+  step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
+  if [[ -n "${BINHARIC_NO_GPU:-}" ]]; then "$BIN" fix --no-gpu || true; else "$BIN" fix || true; fi
+fi
 
 if [[ -z $GLOBAL_OK && ":$PATH:" != *":$BIN_DIR:"* ]]; then
   printf '\n\033[1;33m%s is not on your PATH.\033[0m Add it with:\n' "$BIN_DIR"

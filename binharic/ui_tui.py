@@ -48,7 +48,8 @@ class Dashboard:
                 self.log.append((t, "recv" if ev["ok"] else "error",
                                  f"{'✔' if ev['ok'] else '✖'} {via}: {ev['decoded']}"))
             elif kind == "received":
-                self.log.append((t, "locked" if ev["locked"] else "recv", ev["text"]))
+                frm = f"   ({ev['source']})" if ev.get("source") else ""
+                self.log.append((t, "locked" if ev["locked"] else "recv", ev["text"] + frm))
             elif kind in ("log", "error"):
                 self.log.append((t, ev.get("level", "error") if kind == "log" else "error", ev["text"]))
 

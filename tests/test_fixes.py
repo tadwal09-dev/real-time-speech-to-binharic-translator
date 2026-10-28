@@ -343,7 +343,9 @@ def test_hear_announces_itself_only_once_audio_arrives(monkeypatch):
 
         def close(self):
             pass
+    from binharic import incoming
     monkeypatch.setattr(core, "Input", SlowIn)
+    monkeypatch.setattr(incoming, "Input", SlowIn)  # PipeWire: --hear goes through incoming.Incoming
     tr = core.Translator(core.Settings(control_socket=False, hear="friend"))
     tr._on_pulse = True
     tr.subscribe(lambda k, e: k == "log" and logs.append(e["text"]))

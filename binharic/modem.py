@@ -384,6 +384,9 @@ class StreamDecoder:
         self._pre_len = int(PREAMBLE_SECONDS * sr)
         self._searched = 0            # absolute index up to which chirps were searched
         self._cands: dict[int, int] = {}  # absolute chirp position -> samples needed before retrying
+        # screeches heard but not readable: the header was right for its mode, the checksum
+        # wasn't (noise suppression, a bad connection). Random noise almost never gets that far
+        self.garbled = 0
 
     def feed(self, samples: np.ndarray) -> list[codec.Message]:
         self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=np.float32).ravel()])
@@ -426,6 +429,7 @@ class StreamDecoder:
             if p not in self._cands or (self._cands[p] > end and not final):
                 continue  # still arriving
             waiting = None
+            broken = False
             for spec in self.specs:
                 try:
                     msg, stop = try_decode_at(self.buf, self.sr, p - self.base, spec, self.key)
@@ -433,7 +437,8 @@ class StreamDecoder:
                     need = self.base + e.needed
                     waiting = need if waiting is None else min(waiting, need)
                     continue
-                except codec.BadFrame:
+                except codec.BadFrame as e:
+                    broken = broken or str(e) == "crc mismatch"
                     continue
                 out.append(msg)
                 stop += self.base
@@ -443,6 +448,7 @@ class StreamDecoder:
             else:
                 if waiting is None or final:
                     self._cands.pop(p, None)  # not a frame after all (or it never finished)
+                    self.garbled += broken
                 else:
                     self._cands[p] = waiting
         # keep audio from the oldest open candidate, or a chirp's worth of tail;

@@ -55,8 +55,9 @@ class _PulseStream:
     def __init__(self, cmd: list[str], what: str, playback: bool,
                  notify: Callable[[str], None] | None = None,
                  before_reconnect: Callable[[], None] | None = None,
-                 device: str | None = None):
+                 device: str | None = None, reconnect: bool = True):
         self.cmd = cmd
+        self.reconnect = reconnect  # False: when it ends, it's over (an app's stream that closed)
         self.what = what            # e.g. "play to 'binharic_out'"
         self.playback = playback
         self.device = device
@@ -125,7 +126,7 @@ class _PulseStream:
 
     def recover(self) -> None:
         """Called when the stream broke. Reconnect, or raise if that's hopeless."""
-        if self.closed:
+        if self.closed or not self.reconnect:
             raise EOFError
         try:
             self.proc.kill()
@@ -233,7 +234,7 @@ class Input:
     """Blocks of mono float32 audio from a mic / source."""
 
     def __init__(self, sr: int, source: str | None = None, device=None, blocksize: int = 4800,
-                 notify: Callable[[str], None] | None = None):
+                 notify: Callable[[str], None] | None = None, app_stream: int | None = None):
         self.sr = sr
         self.blocksize = blocksize
         self.notify = notify or _warn
@@ -241,7 +242,13 @@ class Input:
         self._warned_overflow = -1e9
         self._pulse: _PulseStream | None = None
         self._stream = None
-        if source:
+        if app_stream is not None:
+            # one app's playback on its own (what pavucontrol's per-app meters use): ends with the app's stream
+            self._pulse = _PulseStream(
+                [_require("parec"), f"--monitor-stream={app_stream}", "--raw", "--format=s16le",
+                 f"--rate={sr}", "--channels=1", "--latency-msec=100", "--client-name=binharic"],
+                f"record app stream {app_stream}", playback=False, notify=notify, reconnect=False)
+        elif source:
             self._pulse = _PulseStream(
                 [_require("parec"), f"--device={source}", "--raw", "--format=s16le",
                  f"--rate={sr}", "--channels=1", "--latency-msec=20", "--client-name=binharic"],

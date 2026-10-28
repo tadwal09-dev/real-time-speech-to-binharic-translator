@@ -124,7 +124,8 @@ class Printer:
                           f"  FAILED {via}: {ev['decoded']}")
         elif kind == "received":
             style = "yellow" if ev["locked"] else "bold green"
-            self._out(f"[dim]{t}[/] [{style}]▼ {_esc(ev['text'])}[/]", f"{t} << {ev['text']}")
+            frm = f" ({ev['source']})" if ev.get("source") else ""
+            self._out(f"[dim]{t}[/] [{style}]▼ {_esc(ev['text'])}[/][dim]{_esc(frm)}[/]", f"{t} << {ev['text']}{frm}")
 
 
 def describe(tr: Translator) -> str:

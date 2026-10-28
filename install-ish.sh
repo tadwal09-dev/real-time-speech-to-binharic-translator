@@ -19,8 +19,10 @@ python3 -m venv --system-site-packages "$HOME/.binharic-venv"
 "$HOME/.binharic-venv/bin/pip" install --quiet --no-deps .
 ln -sf "$HOME/.binharic-venv/bin/binharic" /usr/local/bin/binharic
 
-echo ":: checking"
-binharic fix --no-gpu || true
+if [ -z "$BINHARIC_UPDATE" ]; then
+  echo ":: checking"
+  binharic fix --no-gpu || true
+fi
 
 cat <<'MSG'
 

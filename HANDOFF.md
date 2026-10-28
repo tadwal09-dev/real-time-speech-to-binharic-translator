@@ -23,6 +23,24 @@ All of that is built and was tested against a simulated desktop (see below). **I
 yet worked end to end on the user's real machine.** The latest report, below, is the
 current blocker.
 
+## Branch `experimental` (copied from `claude/happy-gates-btt1f9` at `d2bdc36`, on the user's request)
+
+The user said the decoder "doesn't work for me". Their history shows `binharic gui --hear speakers`,
+then `binharic decode`. Findings on their desktop:
+- **The decoder's signal processing is fine.** A friend's screech captured from Discord's own
+  playback stream had a chirp match of 0.99 and a valid header, and the text read cleanly
+  until my clip ended. Offline, the screech survives Opus from 12 to 64 kbps and 16 kHz
+  Bluetooth headset audio (38 of 39 combinations; the one failure was hex mode at 12 kbps).
+- **Plain `decode` listened only to the mic.** The friend's screech plays inside the earbuds.
+- **The speakers' mix:** in-band sound about as loud as the screech garbles it (measured with
+  their real playback).
+- **Fixes:** `incoming.py` (per-app taps, the mix, the mic, dedupe, "heard but couldn't
+  read"); `decode` listens to all of them by default; `--hear speakers` uses them.
+- **Update manager:** `binharic update [--check] [--branch main|experimental]` (`update.py`).
+  The installers accept `BINHARIC_UPDATE=1` / `-Update` to skip `fix`.
+- CI runs on pushes to `main` and `claude/happy-gates-btt1f9` only; for `experimental`, start it
+  with `gh workflow run ci.yml --ref experimental`.
+
 ## Status after the latest session (diagnosed on the user's real machine)
 
 The user asked to diagnose why it didn't work on their machine. Findings, all on their real

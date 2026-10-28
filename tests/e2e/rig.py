@@ -202,6 +202,22 @@ class LinuxRig:
         subprocess.run(["pacat", "--playback", f"--device={sink}", "--raw", "--format=s16le", f"--rate={SR}",
                         "--channels=1", "--client-name=e2e-play"], input=pcm, check=True)
 
+    def play_app(self, audio: np.ndarray, name: str) -> subprocess.Popen:
+        """An app playing on the speakers in its own stream (like Discord), in the background."""
+        p = subprocess.Popen(["pacat", "--playback", f"--device={self.SPEAKERS}", "--raw", "--format=s16le",
+                              f"--rate={SR}", "--channels=1", f"--client-name={name}"],
+                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
+
+        def write():
+            try:
+                p.stdin.write(pcm)
+                p.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        threading.Thread(target=write, daemon=True).start()
+        return p
+
     def record(self, where: str = "vmic") -> "LinuxRecorder":
         source = {"vmic": "binharic_mic", "speakers": f"{self.SPEAKERS}.monitor", "mic": self.MIC}[where]
         return LinuxRecorder(source)

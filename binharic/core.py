@@ -421,7 +421,7 @@ class Translator:
             pulse.check_device(self.s.sink, "sinks")
         if self.s.source:
             pulse.check_device(self.s.source, "sources")
-        if self.s.hear:
+        if self.s.hear and self.s.hear not in ("speakers", "monitor"):
             pulse.check_device(self.s.hear, "sources")
         if not self.s.source and not self.s.input_device:
             self.s.source = pulse.real_source()
@@ -732,10 +732,11 @@ class Translator:
                 self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
 
     def _hear_loop(self):
-        self._hear_in = Input(SR, source=self.s.hear if self._on_pulse else None,
-                              device=None if self._on_pulse else self._hear_device,
-                              blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
-        dec = modem.StreamDecoder(SR, "auto", key=self.s.hear_key or self.s.key, speed=self.s.speed)
+        key = self.s.hear_key or self.s.key
+        if self._on_pulse:
+            return self._hear_incoming(key)
+        self._hear_in = Input(SR, device=self._hear_device, blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
+        dec = modem.StreamDecoder(SR, "auto", key=key, speed=self.s.speed)
         announced = False
         while not self._stop.is_set():
             try:
@@ -746,11 +747,37 @@ class Translator:
                 announced = True
                 self.log(f"decoding incoming binharic from {self.s.hear}")
             for m in dec.feed(block):
-                if m.locked and (self.s.hear_key or self.s.key):
-                    continue  # doesn't match our key: a decoy (or someone else's key)
-                name = modem.MODES_BY_ID.get(m.mode_id)
-                self.emit("received", text=m.display(), locked=m.locked,
-                          mode=name.name if name else "?")
+                self._received(m, key)
+
+    def _hear_incoming(self, key):
+        """PipeWire: 'speakers' is what your PC plays, the mix and each app on its own, so
+        music playing over a friend's screech in Discord can't garble it."""
+        from .incoming import Incoming
+        speakers = self.s.hear in ("speakers", "monitor")
+        name = pulse.speakers_monitor() if speakers else self.s.hear
+        label = "your speakers" if speakers else pulse.describe(name, "sources")
+        inc = Incoming(SR, [(label, name)] if name else [], apps=speakers, key=key, speed=self.s.speed,
+                       notify=lambda m: self.log(m, "warn"))
+        self._hear_in = inc
+        inc.start()
+        while not inc.wait_flowing(0.2):  # only once audio really arrives: earlier messages would be missed
+            if self._stop.is_set():
+                return
+        self.log("decoding incoming binharic from " +
+                 ("what your PC plays (each app on its own)" if speakers else label))
+        while not self._stop.is_set():
+            for h in inc.get(0.2):
+                if h.message is None:
+                    self.log(f"heard a screech from {h.source} but couldn't read it (garbled on the way: noise "
+                             "suppression in the voice app, or a bad connection)", "warn")
+                else:
+                    self._received(h.message, key, h.source)
+
+    def _received(self, m, key, source: str | None = None):
+        if m.locked and key:
+            return  # doesn't match our key: a decoy (or someone else's key)
+        name = modem.MODES_BY_ID.get(m.mode_id)
+        self.emit("received", text=m.display(), locked=m.locked, mode=name.name if name else "?", source=source)
 
     def _guard_loop(self):
         """Discord etc. picked the Binharic Mic, but PipeWire linked them to your real

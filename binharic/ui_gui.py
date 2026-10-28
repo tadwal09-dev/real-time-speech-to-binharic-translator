@@ -274,7 +274,7 @@ def run(tr: Translator) -> None:
                 add_log("recv" if ev["ok"] else "error",
                         f"{'✔' if ev['ok'] else '✖'} {via} {'OK' if ev['ok'] else 'FAILED'}: {ev['decoded']}")
             elif kind == "received":
-                add_log("locked" if ev["locked"] else "recv", ev["text"])
+                add_log("locked" if ev["locked"] else "recv", ev["text"], f"from {ev['source']}" if ev.get("source") else None)
             elif kind == "log":
                 add_log(ev.get("level", "info"), ev["text"])
             elif kind == "error":

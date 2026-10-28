@@ -531,6 +531,35 @@ def decode_live_from_a_device(ctx):
     check(lay.text.count("live decoding") == 1 and "[encrypted" not in lay.text, f"decoys hidden:\n{lay.text}")
 
 
+@case({"linux"})
+def decode_reads_a_friend_through_loud_sound(ctx):
+    # regression: plain `binharic decode` listened only to the mic (a friend's screech in
+    # Discord plays inside the user's earbuds), and in the speakers' mix, voices or music
+    # about as loud as the screech garbled it. Now each app's own stream is decoded too
+    screech = modem.encode_text("meet at the forge", sr=SR, volume=0.3)
+    discord = np.concatenate([np.zeros(SR, np.float32), screech, np.zeros(SR, np.float32)])
+    n = len(discord) + 2 * SR
+    f = np.fft.rfft(np.random.default_rng(1).standard_normal(n))
+    hz = np.fft.rfftfreq(n, 1 / SR)
+    f[(hz < 700) | (hz > 3200)] = 0
+    loud = np.fft.irfft(f, n)
+    loud = (loud / np.sqrt(np.mean(loud * loud)) * 0.5).astype(np.float32)  # in the screech's band, 2.7x as loud
+    check(texts(discord + loud[SR // 2:SR // 2 + len(discord)]) == [], "precondition: the mix alone is unreadable")
+    lay = Layer(ctx, "decode", [])
+    lay.wait_for("listening for binharic", 30)
+    ctx.record("speakers")  # the mix, saved if this fails
+    music = ctx.rig.play_app(loud, "e2e-music")
+    time.sleep(0.5)
+    friend = ctx.rig.play_app(discord, "e2e-discord")
+    try:
+        lay.wait_for(r"meet at the forge.*e2e-discord", 30)
+    finally:
+        for p in (music, friend):
+            p.kill()
+    check(lay.stop() == 0, f"decode stops cleanly:\n{lay.text[-800:]}")
+    check(lay.text.count("meet at the forge") == 1, f"shown once:\n{lay.text}")
+
+
 # == the layer ==========================================================================
 
 @case(AUDIO)

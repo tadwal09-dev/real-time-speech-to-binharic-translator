@@ -17,6 +17,7 @@ import os
 import shutil
 import signal
 import sys
+import time
 
 import numpy as np
 
@@ -106,7 +107,7 @@ def _settings(args):
         sink=sink, source=pulse.resolve_source(args.source) or (cfg.get("source") if not args.input_device else None),
         output_device=args.output_device, input_device=args.input_device or cfg.get("input_device"),
         duplex=args.duplex, end_ms=pause,
-        hear=pulse.resolve_source(args.hear) if pulse.available() else args.hear, hear_key=_key(args.hear_key) if args.hear_key else None,
+        hear=args.hear if args.hear in ("speakers", "monitor") or not pulse.available() else pulse.resolve_source(args.hear), hear_key=_key(args.hear_key) if args.hear_key else None,
     )
 
 
@@ -165,6 +166,11 @@ def cmd_ish(args):
 def cmd_fix(args):
     from . import fix
     sys.exit(fix.run(yes=args.yes, gpu=not args.no_gpu))
+
+
+def cmd_update(args):
+    from . import update
+    sys.exit(update.run(check=args.check, branch=args.branch, say=lambda t: say_line(esc(t), t)))
 
 
 def cmd_listen(args):
@@ -331,33 +337,35 @@ def cmd_decode(args):
             print(m.display())
         return
 
-    from .audio import Input
-    source = pulse.resolve_source(args.source)
-    if source is None and not args.input_device and pulse.available():
-        source = pulse.real_source()
-    elif source:
-        pulse.check_device(source, "sources")
-    device = None
-    if not source and args.input_device:
-        from . import pa
-        device = pa.resolve(args.input_device, "input")
     def interrupt(*_):
         raise KeyboardInterrupt
     for name in ("SIGTERM", "SIGBREAK"):  # stop like Ctrl+C: decode what's buffered, close cleanly
         if getattr(signal, name, None) is not None:
             signal.signal(getattr(signal, name), interrupt)
-    mic = Input(SR, source=source, device=device)
-    dec = modem.StreamDecoder(SR, args.mode, key=key, speed=args.speed, threshold=args.threshold)
-    where = pulse.describe(source, "sources") if source else args.input_device or "the default mic"
 
-    def show(m):
+    def show(m, where=None):
         if m.locked and key:
             return  # a decoy (or a different key)
         tag = modem.MODES_BY_ID[m.mode_id].name if m.mode_id in modem.MODES_BY_ID else "?"
         style = "yellow" if m.locked else "bold green"
+        frm = f"  [dim]{esc('(' + where + ')')}[/]" if where else ""
         # decoded text is whatever someone sent: never let it be read as markup
-        say_line(f"[{style}]▼ {esc('[' + tag + ']')} {esc(m.display())}[/]", f"<< [{tag}] {m.display()}")
+        say_line(f"[{style}]▼ {esc('[' + tag + ']')} {esc(m.display())}[/]{frm}",
+                 f"<< [{tag}] {m.display()}" + (f"  ({where})" if where else ""))
 
+    if pulse.available() and not args.input_device:
+        return _decode_incoming(args, key, show)
+
+    if args.source:
+        sys.exit("--source needs PipeWire or PulseAudio; use --input-device (see `binharic devices`)")
+    from .audio import Input
+    device = None
+    if args.input_device:
+        from . import pa
+        device = pa.resolve(args.input_device, "input")
+    mic = Input(SR, device=device)
+    dec = modem.StreamDecoder(SR, args.mode, key=key, speed=args.speed, threshold=args.threshold)
+    where = args.input_device or "the default mic"
     try:
         first = mic.read()  # say "listening" once audio really arrives, not before
         say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
@@ -371,6 +379,51 @@ def cmd_decode(args):
             show(m)
     finally:
         mic.close()
+
+
+def _decode_incoming(args, key, show):
+    """PipeWire/PulseAudio: by default your mic *and* everything your PC plays, each
+    app on its own (a friend's screech in Discord plays in your headphones, where the
+    mic can't hear it, and music over it would garble it in the speakers' mix)."""
+    from . import pulse
+    from .incoming import Incoming
+    if args.source in (None, "", "speakers", "monitor"):
+        sources, apps = [], True
+        spk = pulse.speakers_monitor()
+        if spk:
+            sources.append(("your speakers", spk))
+        if not args.source:
+            mic = pulse.real_source()
+            if mic:
+                sources.insert(0, (f"your mic, {pulse.describe(mic, 'sources')}", mic))
+        where = ("your mic and " if not args.source and len(sources) > 1 else "") + \
+            "what your PC plays (each app on its own)"
+    else:
+        name = pulse.resolve_source(args.source)
+        pulse.check_device(name, "sources")
+        sources, apps, where = [(pulse.describe(name, "sources"), name)], False, pulse.describe(name, "sources")
+    inc = Incoming(SR, sources, apps=apps, mode=args.mode, key=key, speed=args.speed, threshold=args.threshold,
+                   notify=lambda m: say_line(f"[yellow]⚙ {esc(m)}[/]", f"* {m}"))
+    try:
+        inc.start()
+        inc.wait_flowing(5.0)  # say "listening" once audio really arrives, not before
+        say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
+        while True:
+            for h in inc.get(0.2):
+                if h.message is None:
+                    say_line(f"[yellow]✖ heard a screech from {esc(h.source)} but couldn't read it[/] [dim](garbled on "
+                             "the way: noise suppression in the voice app, a bad connection, or a different --speed)[/]",
+                             f"!! heard a screech from {h.source} but couldn't read it")
+                else:
+                    show(h.message, h.source if apps or len(sources) > 1 else None)
+    except KeyboardInterrupt:
+        inc.close()
+        time.sleep(0.3)  # the readers decode what they still have
+        for h in inc.get(0.1):
+            if h.message is not None:
+                show(h.message, h.source if apps or len(sources) > 1 else None)
+    finally:
+        inc.close()
 
 
 def cmd_text(args):
@@ -670,6 +723,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-y", "--yes", action="store_true", help="don't ask, just fix")
     s.add_argument("--no-gpu", action="store_true", help="skip the (1.5 GB) GPU library download")
     s.set_defaults(func=cmd_fix)
+    s = sub.add_parser("update", help="get the newest version, from any folder: pulls the clone you installed "
+                                      "from and reinstalls it")
+    s.add_argument("--check", action="store_true", help="only show what's new")
+    s.add_argument("--branch", help="follow another branch from now on: main (stable) or experimental")
+    s.set_defaults(func=cmd_update)
     s = sub.add_parser("ish", help="iSH on iOS: dictate or type, get sound files")
     s.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic")
     s.add_argument("-k", "--key")

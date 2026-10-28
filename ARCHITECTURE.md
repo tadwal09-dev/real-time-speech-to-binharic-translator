@@ -56,6 +56,8 @@ is written. While OFF, the output is silent, or your voice with
 | `binharic/osinfo.py` | Platform detection (Windows, iSH), runtime/config dirs, saved config |
 | `binharic/gpu.py` | Loads CUDA 12 cuBLAS/cuDNN from pip wheels for Whisper |
 | `binharic/ish.py` | iSH mode: text (dictation) → WAV files in `~/binharic`, m4a input via ffmpeg |
+| `binharic/incoming.py` | `Incoming`: decodes several inputs at once (mic, the speakers' mix, each app's own playback stream), merges and dedupes; used by `decode` and `--hear` on PipeWire/Pulse |
+| `binharic/update.py` | `binharic update`: finds the clone binharic was installed from (`direct_url.json`), fetches, fast-forwards or switches branch, reruns the installer with `BINHARIC_UPDATE=1` |
 | `binharic/ui_cli.py` | `listen`: the plain log (`Printer` turns events into lines) |
 | `binharic/ui_tui.py` | `tui`: curses dashboard (`Dashboard`) |
 | `binharic/ui_gui.py` | `gui`: Tk window (`run`) |
@@ -76,7 +78,8 @@ is written. While OFF, the output is silent, or your voice with
 | `toggle` / `on` / `off` / `status` | Control a running layer through the control socket | `cmd_ctl` → `_control` |
 | `privacy LEVEL`, `send WHEN` | Change a running layer's privacy, or when it screeches | `_control` |
 | `say TEXT` | Screech typed text: into the running layer if there is one, else straight into the Binharic Mic (or the speakers), or `--wav FILE` | `cmd_say` |
-| `decode` | Turn binharic back into text, from the mic, a source/device, or a WAV | `cmd_decode` |
+| `decode` | Turn binharic back into text: by default the mic plus what the PC plays (the mix and every app on its own); or `--source speakers`, a source/device, or a WAV | `cmd_decode`, `_decode_incoming` |
+| `update [--check] [--branch B]` | Update from any folder: pull the install clone and reinstall; switch between `main` and `experimental` | `cmd_update` → `update.run` |
 | `text` | Show text as binary/hex, or `--reverse` to read it back | `cmd_text` |
 | `mic up/down/status` | Create or remove the Binharic Mic (Linux); explains VB-Cable on Windows | `cmd_mic` |
 | `devices` | List sinks, sources and PortAudio devices | `cmd_devices` |
@@ -94,7 +97,7 @@ is written. While OFF, the output is silent, or your voice with
 | `stt` | loads the engine, then VAD + recognition; emits `level`, `speech`, `partial`; calls `_on_send` | fatal |
 | `out` | owns the output: plays queued screeches, passthrough voice, or silence (PortAudio needs a steady stream) | fatal |
 | `air` | test mode: decodes what the mic heard from the speakers | logged |
-| `hear` | `--hear`: decodes incoming binharic from another source or device | logged |
+| `hear` | `--hear`: decodes incoming binharic from another source or device; on PipeWire `speakers` means the mix plus every app's own stream (`incoming.Incoming`) | logged |
 | `guard` | PipeWire, screeching into the Binharic Mic: every 2 s, moves apps that picked the Binharic Mic but were linked elsewhere back onto it (`pulse.misrouted_mic_streams`) | logged |
 | `control` | the control socket (below) | logged |
 
@@ -192,6 +195,25 @@ interrupt `accept()` on Windows.
   what's left when input ends.
 * `frames_with_decoys` hides the real frame at a random place among N
   decoys of random length (system RNG).
+
+### Incoming binharic: `incoming.py`
+
+* A friend's screech arrives in an app's playback (Discord) and plays in the user's
+  headphones: the mic never hears it. `decode` therefore listens to the mic, the speakers'
+  monitor, and every app's playback stream on its own (`Input(app_stream=N)` →
+  `parec --monitor-stream=N`, the same thing pavucontrol's per-app meters use).
+* Why per app: in the speakers' mix, sound in the screech's band that is about as loud as the
+  screech garbles it. That was measured on the user's desktop. Discord's own stream has only
+  the screech.
+* Why the mix as well: an app's tap starts only once its stream exists (`pactl subscribe`
+  wakes the scanner at once, with a rescan every second as a fallback). A sound whose screech
+  starts in its first moments is caught by the mix.
+* Each input has its own `StreamDecoder`. `Incoming.get` shows a message once even when
+  several inputs read it (the same bytes within `SAME` seconds).
+* `StreamDecoder.garbled` counts frames whose header was right for their mode but whose CRC
+  failed: a screech damaged on the way. Random noise practically never gets that far.
+  `Incoming` reports it only if no other input read that screech.
+* Our own streams (`application.name` binharic) are never tapped.
 
 ## 6. Frames and encryption: `codec.py`
 

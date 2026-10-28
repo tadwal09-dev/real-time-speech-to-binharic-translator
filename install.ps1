@@ -1,7 +1,7 @@
 # Windows installer. In PowerShell, from the repo folder:
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
-param([switch]$Uninstall, [switch]$NoGpu)
+param([switch]$Uninstall, [switch]$NoGpu, [switch]$Update)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -55,8 +55,10 @@ $lnk.WorkingDirectory = $Data; $lnk.Save()
 Step "speech models"
 Retry { & $Exe download-model } | Out-Null
 
-Step "finding and fixing problems (it will ask you to talk)"
-if ($NoGpu) { & $Exe fix --no-gpu } else { & $Exe fix }
+if (-not $Update) {  # `binharic update`: the setup was already checked when it was installed
+  Step "finding and fixing problems (it will ask you to talk)"
+  if ($NoGpu) { & $Exe fix --no-gpu } else { & $Exe fix }
+}
 
 Write-Host @"
 

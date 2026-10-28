@@ -32,8 +32,22 @@ The installer does five things:
 - creates the Binharic Mic
 - runs `binharic doctor` to check everything
 
-Nothing you say is sent to the cloud. To update, `git pull` and run `./install.sh`
-again. `./install.sh --uninstall` removes it.
+Nothing you say is sent to the cloud. `./install.sh --uninstall` removes it.
+
+### Updating
+
+From any folder:
+
+```sh
+binharic update                        # pull the newest version and reinstall it
+binharic update --check                # only show what's new
+binharic update --branch experimental  # follow the experimental branch from now on
+binharic update --branch main          # back to the stable one
+```
+
+It updates the clone you installed from (it remembers where) and runs its installer again,
+without the "talk to test your mic" step. `main` only gets changes after they passed every
+test three times; `experimental` gets them first. Restart a running binharic afterwards.
 
 ## Something not working? `binharic fix`
 
@@ -293,11 +307,18 @@ read by this version (unencrypted ones still can).
 ## The other side: understanding it
 
 ```sh
-binharic decode -k KEY                    # listen on the mic
-binharic decode -k KEY --source speakers  # decode whatever your PC is playing (e.g. Discord)
+binharic decode -k KEY                    # your mic + everything your PC plays (Discord...)
+binharic decode -k KEY --source speakers  # only what your PC plays
+binharic decode --source binharic_mic     # one particular input
 binharic decode --wav recording.wav
 binharic gui --hear speakers              # see incoming messages decoded inside the GUI/TUI
 ```
+
+A friend's screech in Discord plays in your headphones, where your mic can't hear it, so
+`decode` listens to what your PC plays too: the mix your speakers get, and every app on its
+own. On its own, Discord's screech decodes even while music or a game plays over it, and each
+message says which app it came from. If a screech arrives but can't be read, `decode` says
+so: usually the sender's voice app has noise suppression on.
 
 ## Other commands
 
