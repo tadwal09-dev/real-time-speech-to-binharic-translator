@@ -75,6 +75,13 @@ everything does". Done in this session:
     stream to the default speakers instead of `binharic_out`: the Binharic Mic went silent
     and the screech played out loud. pacat/parec streams now check where they were linked
     for 10 s after (re)connecting and move themselves back (`pulse.stream_device`).
+  - Unit tests: the fake speakers took audio instantly, so the output thread "played"
+    hours of silence and one test took 5 minutes (and once ran out of memory) on Windows /
+    Python 3.10. The fakes now run in real time, like real devices.
+- **Result**: three CI runs in a row fully green on the same commit (`6dda0cb`, runs 12–14 of
+  `ci.yml`): Windows e2e 30/30 cases, Arch 34/34, Ubuntu 34/34, iSH 9/9, and the unit tests
+  on Ubuntu and Windows × Python 3.10/3.12/3.14. That commit was then fast-forwarded to
+  `main`.
 - `BINHARIC_DUMP_INPUT=folder` saves what every `Input` recorded as WAVs. It's for
   diagnosing a user's mic, and the e2e suite keeps these dumps for failed cases.
 - The Windows CI rig's test mic (VB-Audio Hi-Fi Cable) has mismatched rates out of the box
@@ -137,7 +144,8 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
    output. The key unknown: does the CMF Buds Pro 2 mic work in headset mode? If not,
    `fix` recommends the built-in or a wired mic.
 2. Confirm that the resumable CUDA download finishes on their connection, and measure GPU latency.
-3. First real runs on Windows and in iSH will probably turn up platform bugs.
+3. Windows passes the e2e suite on a GitHub runner (Windows Server, VB-Cable), but a real
+   PC with real hardware and Discord, and a real iSH on an iPhone, are still untested.
 
 ## The user's environment
 
@@ -209,6 +217,9 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 ## Conventions
 
 - Develop and push on `claude/happy-gates-btt1f9`. Don't open a PR unless asked.
+- `main` holds the shipped code. Ship to it (fast-forward) only after CI passes three times in a
+  row on the commit being shipped (`workflow_dispatch` reruns, `repeat` input for more rounds).
+- Read `ARCHITECTURE.md` before changing code, and update it when you change how something works.
 - Commit trailers: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and a
   `Claude-Session:` line. Put no model names in code or docs.
 - Keep the user-facing README in sync, and add a regression test for every bug fixed.
