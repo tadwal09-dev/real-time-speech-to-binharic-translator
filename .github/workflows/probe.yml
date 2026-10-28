@@ -1,0 +1,33 @@
+name: probe
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/happy-gates-btt1f9]
+    paths: [.github/workflows/probe.yml, .github/scripts/**]
+jobs:
+  windows-audio:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: .github/scripts/windows-audio.ps1
+        shell: pwsh
+      - run: |
+          pip install numpy sounddevice
+          python -c "import sounddevice as sd; print(sd.query_devices()); print(sd.query_hostapis())"
+        shell: pwsh
+      - name: play into CABLE Input, record CABLE Output
+        shell: python
+        run: |
+          import numpy as np, sounddevice as sd
+          devs = sd.query_devices()
+          out = next(i for i, d in enumerate(devs) if d["name"].startswith("CABLE Input") and d["max_output_channels"])
+          inp = next(i for i, d in enumerate(devs) if d["name"].startswith("CABLE Output") and d["max_input_channels"])
+          t = np.arange(48000) / 48000
+          sig = (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+          rec = sd.playrec(np.concatenate([np.zeros(12000, np.float32), sig, np.zeros(12000, np.float32)]).reshape(-1, 1),
+                           samplerate=48000, channels=1, dtype="float32", device=(inp, out))
+          sd.wait()
+          print("peak through the cable:", float(np.abs(rec).max()))
