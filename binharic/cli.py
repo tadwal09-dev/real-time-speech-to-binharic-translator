@@ -341,6 +341,11 @@ def cmd_decode(args):
     if not source and args.input_device:
         from . import pa
         device = pa.resolve(args.input_device, "input")
+    def interrupt(*_):
+        raise KeyboardInterrupt
+    for name in ("SIGTERM", "SIGBREAK"):  # stop like Ctrl+C: decode what's buffered, close cleanly
+        if getattr(signal, name, None) is not None:
+            signal.signal(getattr(signal, name), interrupt)
     mic = Input(SR, source=source, device=device)
     dec = modem.StreamDecoder(SR, args.mode, key=key, speed=args.speed, threshold=args.threshold)
     where = pulse.describe(source, "sources") if source else args.input_device or "the default mic"

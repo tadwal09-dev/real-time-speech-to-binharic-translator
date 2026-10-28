@@ -385,3 +385,56 @@ def test_test_mode_speakers_keep_streaming_between_screeches():
     tr._stop.set()
     t.join(2)
     assert tr._local_out.samples > 48000 * 0.3, tr._local_out.samples
+
+
+def test_latency_report_uses_the_start_delay_not_the_buffer():
+    # the playback buffer is deep (so a busy CPU can't starve a screech), but a
+    # new screech is heard long before that buffer's worth: report the real delay
+    class Out:
+        latency, start_latency, needs_feeding = 0.25, 0.1, False
+
+        def write(self, x):
+            pass
+    tr = core.Translator(core.Settings(control_socket=False))
+    sent = []
+    tr.subscribe(lambda k, e: k == "sent" and sent.append(e))
+    now = time.monotonic()
+    tr._queue_text("hello", True, meta=dict(stopped_at=now, stt_ms=0.0, speculative=False))
+    tr._play_text(Out(), *tr._take_pending())
+    assert 100 <= sent[0]["latency_ms"] < 240, sent[0]["latency_ms"]
+    assert tr._mute_until - time.monotonic() > 0.25 + 0.4 - 0.1  # ...but the mic waits for the whole buffer
+
+
+def test_input_dump_keeps_exactly_what_was_recorded(monkeypatch, tmp_path):
+    # BINHARIC_DUMP_INPUT: to see what binharic really heard when a mic misbehaves
+    from binharic import audio
+
+    class Stream:
+        latency = 0.01
+
+        def __init__(self, **kw):
+            assert kw["latency"] == "high"  # "low" made Windows' MME drop input
+            self.n = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+        def read(self, n):
+            self.n += 1
+            return np.full((n, 1), 0.1 * self.n, np.float32), False
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(InputStream=Stream))
+    monkeypatch.setenv("BINHARIC_DUMP_INPUT", str(tmp_path))
+    mic = audio.Input(16000, blocksize=1600)
+    mic.read()
+    mic.read()
+    mic.close()
+    files = list(tmp_path.glob("input-*.wav"))
+    assert len(files) == 1
+    x, sr = audio.read_wav(str(files[0]))
+    assert sr == 16000 and len(x) == 3200 and abs(x[0] - 0.1) < 1e-3 and abs(x[-1] - 0.2) < 1e-3

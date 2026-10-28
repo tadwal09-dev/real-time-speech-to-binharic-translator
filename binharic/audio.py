@@ -12,6 +12,7 @@ Two backends:
 from __future__ import annotations
 
 import collections
+import os
 import shutil
 import subprocess
 import sys
@@ -136,8 +137,11 @@ class _PulseStream:
 class Output:
     """Blocking mono float32 sink. ``write`` returns once the audio is queued."""
 
-    # a buffer deep enough that a busy CPU (Whisper!) can't starve the screech
-    PACAT_LATENCY_MS = 100
+    # a buffer deep enough that a busy CPU (Whisper on every core!) can't starve
+    # the screech: one gap in the middle of a screech loses the whole message.
+    # It costs no start delay: an idle stream fills it instantly from a screech.
+    PACAT_LATENCY_MS = 250
+    PACAT_START_S = 0.05  # measured: heard 20 ms (PulseAudio) to 70 ms (PipeWire) after the write
 
     def __init__(self, sr: int, sink: str | None = None, device=None, blocksize: int = 1024,
                  notify: Callable[[str], None] | None = None,
@@ -148,7 +152,10 @@ class Output:
         self._stream = None
         # PortAudio wants a steady stream of writes; pacat is happy to sit idle
         self.needs_feeding = not sink
+        # latency: how long what was just written keeps playing (the buffer);
+        # start_latency: how long until a new screech is heard
         self.latency = self.PACAT_LATENCY_MS / 1000 if sink else 0.0
+        self.start_latency = self.PACAT_START_S if sink else 0.0
         if sink:
             self._pulse = _PulseStream(
                 [_require("pacat"), "--playback", f"--device={sink}", "--raw", "--format=s16le",
@@ -160,7 +167,7 @@ class Output:
             self._stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32",
                                            device=device, blocksize=blocksize, latency="low")
             self._stream.start()
-            self.latency = float(self._stream.latency)
+            self.latency = self.start_latency = float(self._stream.latency)  # kept full by feeding
 
     def ensure_alive(self) -> None:
         """An idle pacat can't notice the sound server going away until the
@@ -210,11 +217,23 @@ class Input:
                 f"record from '{source}'", playback=False, notify=notify)
         else:
             import sounddevice as sd
+            # "high": with "low", Windows' MME gets a few tiny buffers and drops input
+            # whenever a read comes late; a little more input latency costs nothing here
+            # (recognition takes far longer), lost samples garble speech and screeches
             self._stream = sd.InputStream(samplerate=sr, channels=1, dtype="float32",
-                                          device=device, blocksize=blocksize, latency="low")
+                                          device=device, blocksize=blocksize, latency="high")
             self._stream.start()
+        # BINHARIC_DUMP_INPUT=folder: keep everything recorded, written as a WAV on close
+        # (to see exactly what binharic heard when diagnosing a mic)
+        self._dump: list[np.ndarray] | None = [] if os.environ.get("BINHARIC_DUMP_INPUT") else None
 
     def read(self) -> np.ndarray:
+        block = self._read()
+        if self._dump is not None:
+            self._dump.append(block)
+        return block
+
+    def _read(self) -> np.ndarray:
         if self._pulse:
             while True:
                 raw = self._pulse.proc.stdout.read(self.blocksize * 2)
@@ -237,6 +256,12 @@ class Input:
         if self._stream:
             self._stream.stop()
             self._stream.close()
+        if self._dump:
+            folder = os.environ["BINHARIC_DUMP_INPUT"]
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"input-{os.getpid()}-{id(self) % 10000}.wav")
+            write_wav(path, np.concatenate(self._dump), self.sr)
+            self._dump = None
 
 
 def write_wav(path: str, samples: np.ndarray, sr: int) -> None:

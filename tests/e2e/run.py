@@ -102,6 +102,7 @@ class Ctx:
         if WINDOWS:
             self.env["APPDATA"] = str(tmp / "config")
         self.env.pop("BINHARIC_KEY", None)
+        self.env["BINHARIC_DUMP_INPUT"] = str(tmp / "inputs")  # what binharic heard, kept if a case fails
 
     def bh(self, *args: str, input: str | None = None, timeout: float = 120, env: dict | None = None) -> Result:
         p = subprocess.run(BH + list(args), input=input.encode() if input is not None else None,
@@ -136,7 +137,11 @@ class Ctx:
         return lay
 
     def close(self):
-        for lay in self.layers:
+        for lay in self.layers:  # politely first, so they close their devices (and write dumps)
+            try:
+                lay.stop(timeout=10)
+            except Failed:
+                pass
             lay.kill()
         for rec in self.recorders:
             rec.stop()
@@ -522,7 +527,7 @@ def decode_live_from_a_device(ctx):
     ctx.ok("say", "-k", KEY, "--privacy", "decoys", "--decoys", "2", "live decoding")
     lay.wait_for("live decoding", 30)
     time.sleep(2)
-    lay.stop()
+    check(lay.stop() == 0, f"decode stops cleanly on a stop signal:\n{lay.text[-500:]}")
     check(lay.text.count("live decoding") == 1 and "[encrypted" not in lay.text, f"decoys hidden:\n{lay.text}")
 
 
@@ -832,16 +837,19 @@ def main(argv=None):
                 except Exception:
                     err = traceback.format_exc()
                 finally:
-                    ctx.close()
+                    ctx.close()  # (stops the layers, which writes their input dumps)
                     if rig:
                         rig.reset()
+                    if err:  # the evidence: what the rig recorded, and what binharic heard
+                        for i, rec in enumerate(ctx.recorders):
+                            write_wav(str(artifacts / f"{PLATFORM}-r{rnd}-{name}-{i}.wav"), rec.audio, SR)
+                        for i, f in enumerate(sorted((tmp / "inputs").glob("*.wav"))):
+                            shutil.copy(f, artifacts / f"{PLATFORM}-r{rnd}-{name}-heard-{i}.wav")
                     shutil.rmtree(tmp, ignore_errors=True)
                 secs = time.monotonic() - t
                 print(("ok" if err is None else "FAILED") + f" ({secs:.0f}s)", flush=True)
                 if err:
                     failures += 1
-                    for i, rec in enumerate(ctx.recorders):
-                        write_wav(str(artifacts / f"{PLATFORM}-r{rnd}-{name}-{i}.wav"), rec.audio, SR)
                     print("    " + err.replace("\n", "\n    "), flush=True)
                 report.append({"round": rnd, "case": name, "ok": err is None, "seconds": round(secs, 1),
                                "error": err})

@@ -669,7 +669,8 @@ class Translator:
                 bodies = [(real, modem.modulate_body(f, spec, SR, s.volume)) for real, f in frames]
                 body = next(b for real, b in bodies if real)
                 synth_ms = (time.monotonic() - t) * 1000
-                first_sound = time.monotonic() + out.latency  # when it actually leaves the speaker
+                # when it actually leaves the speaker
+                first_sound = time.monotonic() + getattr(out, "start_latency", out.latency)
                 audio = np.concatenate([x for _, b in bodies for x in (lead, b)])
                 info = dict(text=chunk, hex=codec.to_hex(chunk), binary=codec.to_binary(chunk),
                             seconds=len(audio) / SR, mode=s.mode, synth_ms=synth_ms,
