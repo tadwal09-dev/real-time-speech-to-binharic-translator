@@ -201,14 +201,18 @@ class LinuxRig:
         return ["--source", {"vmic": "binharic_mic", "speakers": "speakers"}[where]]
 
     def hear_args(self) -> list[str]:
-        return ["--hear", "speakers"]
+        return ["--hear", "speakers"]  # what your PC plays: Discord's audio
+
+    hear_from = "speakers"             # where a friend's screech arrives (for play())
 
 
 class LinuxRecorder(Recording):
     def __init__(self, source: str):
         super().__init__()
+        # a relaxed latency: a measuring device mustn't force PipeWire into tiny
+        # cycles (that alone makes a container without realtime scheduling xrun)
         self.proc = subprocess.Popen(["parec", f"--device={source}", "--raw", "--format=s16le", f"--rate={SR}",
-                                      "--channels=1", "--latency-msec=20", "--client-name=e2e-rec"],
+                                      "--channels=1", "--latency-msec=100", "--client-name=e2e-rec"],
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         threading.Thread(target=self._run, daemon=True).start()
         self.wait_flowing()
@@ -221,9 +225,10 @@ class LinuxRecorder(Recording):
             self.blocks.append(np.frombuffer(raw[: len(raw) // 2 * 2], "<i2").astype(np.float32) / 32768)
 
     def stop(self) -> np.ndarray:
-        time.sleep(0.5)
-        self.proc.terminate()
-        self.proc.wait(timeout=5)
+        if self.proc.poll() is None:
+            time.sleep(0.5)
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
         return self.audio
 
 
@@ -294,8 +299,11 @@ class WindowsRig:
         return ["--input-device", self.vmic_name if where == "vmic" else self.mic_name]
 
     def hear_args(self) -> list[str]:
-        # no "what you hear" loopback through PortAudio: incoming screeches arrive on a device
-        return ["--hear", self.mic_name]
+        # no "what you hear" loopback through PortAudio: decode the device a friend's
+        # screech arrives on (here the other cable, as with Stereo Mix or a second cable)
+        return ["--hear", self.vmic_name]
+
+    hear_from = "vmic"
 
 
 class WindowsRecorder(Recording):
@@ -307,9 +315,10 @@ class WindowsRecorder(Recording):
         self.wait_flowing()
 
     def stop(self) -> np.ndarray:
-        time.sleep(0.5)
-        self.stream.stop()
-        self.stream.close()
+        if not self.stream.closed:
+            time.sleep(0.5)
+            self.stream.stop()
+            self.stream.close()
         return self.audio
 
 

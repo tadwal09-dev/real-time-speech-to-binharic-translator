@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import time
 import types
 import wave
 
@@ -282,3 +283,43 @@ def test_layer_hides_decoys_from_key_holders(monkeypatch, tmp_path):
     assert events[0]["decoys"] == 2
     assert len(modem.decode_audio(audio, 48000)) == 3
     assert [m.text for m in modem.decode_audio(audio, 48000, key="cog") if not m.locked] == ["hidden words"]
+
+
+def test_mic_stays_muted_while_the_end_of_the_screech_still_plays():
+    # regression: on Windows the output buffers a lot; the mic unmuted 0.4 s after
+    # the last *write*, heard the rest of its own screech, and Whisper turned it
+    # into a hallucinated sentence that was screeched in turn
+    class Out:
+        latency = 0.6
+        needs_feeding = False
+
+        def write(self, samples):
+            pass
+    tr = core.Translator(core.Settings(control_socket=False))
+    out = Out()
+    tr.say("hello")
+    start = time.monotonic()
+    tr._play_text(out, *tr._take_pending())
+    assert tr._mute_until - time.monotonic() > 0.6 + 0.4 - (time.monotonic() - start) - 0.05
+
+
+def test_dropped_mic_audio_is_reported_once(monkeypatch):
+    from binharic import audio
+    said = []
+
+    class Stream:
+        latency = 0.01
+
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def read(self, n):
+            return np.zeros((n, 1), np.float32), True  # overflow every time
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(InputStream=Stream))
+    mic = audio.Input(48000, notify=said.append)
+    for _ in range(5):
+        mic.read()
+    assert mic.overflows == 5 and len(said) == 1 and "dropped" in said[0]

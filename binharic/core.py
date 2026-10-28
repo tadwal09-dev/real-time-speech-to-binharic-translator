@@ -684,7 +684,10 @@ class Translator:
                         return
                     out.write(audio[i:i + step])
         finally:
-            self._mute_until = time.monotonic() + 0.4  # speaker/room tail
+            # the last write only queued the end of the screech: it is still
+            # playing for the output's latency (large on Windows), then the
+            # speaker/room tail. Keep the mic muted (and --air listening) until then
+            self._mute_until = time.monotonic() + float(getattr(out, "latency", 0.0) or 0.0) + 0.4
             self.screeching.clear()
             self._changed()
 

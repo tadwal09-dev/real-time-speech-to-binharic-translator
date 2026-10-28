@@ -211,6 +211,7 @@ def script(win: Window, tr: core.Translator, rig):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = cli.build_parser().parse_args(["gui", *sys.argv[1:]])
     tr = core.Translator(cli._settings(args))
     rig = make_rig()

@@ -32,7 +32,7 @@ class Terminal:
         env = dict(os.environ, TERM="xterm-256color", LANG=os.environ.get("LANG", "C.UTF-8"))
         if sys.platform == "win32":
             from winpty import PtyProcess
-            self.p = PtyProcess.spawn(subprocess.list2cmdline(argv), dimensions=(ROWS, COLS), env=env)
+            self.p = PtyProcess.spawn(argv, dimensions=(ROWS, COLS), env=env)  # a list: it quotes it itself
             self._read = lambda: self.p.read(4096).encode("utf-8", "replace")
             self._write = self.p.write
         else:
@@ -117,6 +117,7 @@ def record_while(rig, fn, term: Terminal, settle: float = 6.0):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     rig = make_rig()
     rig.attach()
     argv = BH + ["tui", *sys.argv[1:]]

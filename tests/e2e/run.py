@@ -95,6 +95,7 @@ class Ctx:
         self.tmp = tmp
         self.artifacts = artifacts
         self.layers: list[Layer] = []
+        self.recorders: list = []  # what they captured is saved as WAVs when a case fails
         self.env = dict(os.environ)
         # every test starts from a clean config (what `binharic fix` saves)
         self.env["XDG_CONFIG_HOME"] = str(tmp / "config")
@@ -122,9 +123,13 @@ class Ctx:
             check(want.lower() in r.out.lower(), f"`binharic {' '.join(args)}` should say {want!r}: {r}")
         return r
 
+    def record(self, where: str = "vmic"):
+        rec = self.rig.record(where)
+        self.recorders.append(rec)
+        return rec
+
     def layer(self, *args: str, cmd: str = "listen", ready: bool = True, rig_args: bool = True) -> "Layer":
         lay = Layer(self, cmd, (self.rig.layer_args() if rig_args else []) + list(args))
-        self.layers.append(lay)
         if ready:
             lay.wait_for(r"ready \(", 300)
             time.sleep(0.5)
@@ -133,6 +138,8 @@ class Ctx:
     def close(self):
         for lay in self.layers:
             lay.kill()
+        for rec in self.recorders:
+            rec.stop()
 
 
 class Layer:
@@ -144,6 +151,7 @@ class Layer:
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0
         self.proc = subprocess.Popen(BH + self.args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      stdin=subprocess.DEVNULL, env=env or ctx.env, creationflags=flags)
+        ctx.layers.append(self)  # killed by ctx.close() whatever happens
         self.lines: list[str] = []
         self._t = threading.Thread(target=self._read, daemon=True)
         self._t.start()
@@ -233,7 +241,8 @@ class Layer:
 
 def say_and_record(ctx: Ctx, lay: Layer, phrase: str, where: str = "vmic", settle: float = 1.0) -> np.ndarray:
     """Speak a fixture phrase into the mic, wait for the layer to finish, return what came out."""
-    rec = ctx.rig.record(where)
+    rec = ctx.record(where)
+    heard = ctx.record("mic")  # what the mic delivered: saved with the rest if the case fails
     try:
         time.sleep(0.3)
         ctx.rig.play(speech(phrase))
@@ -241,6 +250,7 @@ def say_and_record(ctx: Ctx, lay: Layer, phrase: str, where: str = "vmic", settl
         lay.idle(90, settle)
     finally:
         audio = rec.stop()
+        heard.stop()
     return audio
 
 
@@ -485,20 +495,20 @@ def fix_repairs_and_checks_the_virtual_mic(ctx):
 
 @case(AUDIO)
 def say_into_the_virtual_mic(ctx):
-    rec = ctx.rig.record("vmic")
+    rec = ctx.record("vmic")
     ctx.ok("say", "straight to discord")
     got = texts(rec.stop())
     check(got == ["straight to discord"], f"say -> virtual mic: {got}")
-    rec = ctx.rig.record("vmic")
+    rec = ctx.record("vmic")
     ctx.ok("say", "-k", KEY, "--privacy", "decoys", "--decoys", "1", "-m", "hex", "quietly")
     audio = rec.stop()
-    check(texts(audio, KEY) == ["quietly"] and texts(audio) == [], "encrypted say")
-    check(len(decode(audio)) == 2, "one decoy")
+    check(texts(audio, KEY) == ["quietly"] and texts(audio) == [], f"encrypted say: {decode(audio, KEY)}")
+    check(len(decode(audio)) == 2, f"one decoy and the message: {decode(audio)}")
 
 
 @case({"linux"})
 def say_to_the_speakers(ctx):
-    rec = ctx.rig.record("speakers")
+    rec = ctx.record("speakers")
     ctx.ok("say", "--sink", "default", "out loud")
     check(texts(rec.stop()) == ["out loud"], "say --sink default plays on the speakers")
 
@@ -552,8 +562,9 @@ def listen_encrypted_and_with_decoys(ctx):
     with ctx.layer("-k", KEY) as lay:
         check(lay.status()["privacy"] == "encrypted", "a key means encrypted")
         audio = say_and_record(ctx, lay, "hello")
-        check(texts(audio) == [] and all(m.locked for m in decode(audio)), "nothing readable without the key")
-        check(similar(" ".join(texts(audio, KEY)), PHRASES["hello"]), "the key reads it")
+        check(texts(audio) == [] and all(m.locked for m in decode(audio)), f"readable without the key: {decode(audio)}")
+        check(similar(" ".join(texts(audio, KEY)), PHRASES["hello"]),
+              f"the key reads {texts(audio, KEY)} from {decode(audio, KEY)}:\n{lay.text[-1500:]}")
         check(texts(audio, "heresy") == [], "a wrong key doesn't")
     with ctx.layer("-k", KEY, "--privacy", "decoys", "--decoys", "2") as lay:
         audio = say_and_record(ctx, lay, "gate")
@@ -563,7 +574,7 @@ def listen_encrypted_and_with_decoys(ctx):
         check(len(real) >= 1 and similar(" ".join(real), PHRASES["gate"]), f"key holder: {real}")
     with ctx.layer("-k", KEY, "--privacy", "plain") as lay:
         audio = say_and_record(ctx, lay, "hello")
-        check(similar(" ".join(texts(audio)), PHRASES["hello"]), "key kept but sent in the open")
+        check(similar(" ".join(texts(audio)), PHRASES["hello"]), f"key kept but sent in the open: {texts(audio)}:\n{lay.text[-1500:]}")
     ctx.fails("listen", "--privacy", "encrypted", want="needs a key")
 
 
@@ -587,14 +598,14 @@ def controls_of_a_running_layer(ctx):
         check(decode(audio) == [], "nothing is sent while OFF")
         check("ON" in ctx.ok("on").out, "on")
         audio = say_and_record(ctx, lay, "hello")
-        check(similar(" ".join(texts(audio)), PHRASES["hello"]), "sent again after ON")
+        check(similar(" ".join(texts(audio)), PHRASES["hello"]), f"sent again after ON: {texts(audio)}:\n{lay.text[-1500:]}")
         check("OFF" in ctx.ok("toggle").out and "ON" in ctx.ok("toggle").out, "toggle twice")
         check("as you talk" in ctx.ok("send", "live").out, "send live")
         check("after you finish" in ctx.ok("send", "toggle").out, "send toggle")
         check("as you talk" in ctx.ok("send").out and "after you finish" in ctx.ok("send", "phrase").out, "send")
         for level, word in (("encrypted", "encrypted"), ("decoys", "gibberish"), ("plain", "UNENCRYPTED")):
             check(word in ctx.ok("privacy", level).out and lay.status()["privacy"] == level, level)
-        rec = ctx.rig.record("vmic")
+        rec = ctx.record("vmic")
         r = ctx.ok("say", "typed into the layer")
         check("queued in the running binharic" in r.out, r)
         lay.idle()
@@ -622,7 +633,7 @@ def start_off_and_passthrough(ctx):
 def hear_incoming_binharic(ctx):
     with ctx.layer("--start-off", *ctx.rig.hear_args()) as lay:
         lay.wait_for("decoding incoming binharic", 10)
-        ctx.rig.play(modem.encode_text("message from a friend", sr=SR), "speakers")
+        ctx.rig.play(modem.encode_text("message from a friend", sr=SR), ctx.rig.hear_from)
         lay.wait_for("▼ message from a friend|<< message from a friend", 20)
 
 
@@ -651,7 +662,7 @@ def test_mode_round_trip_and_over_the_air(ctx):
     try:
         lay = ctx.layer("--air", cmd="test")
         with lay:
-            rec = ctx.rig.record("vmic")
+            rec = ctx.record("vmic")
             ctx.rig.play(speech("hello"))
             lay.wait_for("round trip OK|OK round trip", 60)
             lay.wait_for("over the air OK|OK over the air", 60)
@@ -698,7 +709,7 @@ def ignores_hijacked_defaults(ctx):
         with ctx.layer() as lay:
             check("E2E_Mic" in lay.text, f"uses the real mic, not the Binharic Mic:\n{lay.text}")
             audio = say_and_record(ctx, lay, "hello")
-            check(similar(" ".join(texts(audio)), PHRASES["hello"]), "works anyway")
+            check(similar(" ".join(texts(audio)), PHRASES["hello"]), f"works anyway: {texts(audio)}:\n{lay.text[-1500:]}")
     finally:
         ctx.rig.set_defaults()
 
@@ -782,6 +793,8 @@ def main(argv=None):
                 print(("ok" if err is None else "FAILED") + f" ({secs:.0f}s)", flush=True)
                 if err:
                     failures += 1
+                    for i, rec in enumerate(ctx.recorders):
+                        write_wav(str(artifacts / f"{PLATFORM}-r{rnd}-{name}-{i}.wav"), rec.audio, SR)
                     print("    " + err.replace("\n", "\n    "), flush=True)
                 report.append({"round": rnd, "case": name, "ok": err is None, "seconds": round(secs, 1),
                                "error": err})

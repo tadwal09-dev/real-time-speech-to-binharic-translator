@@ -198,6 +198,9 @@ class Input:
                  notify: Callable[[str], None] | None = None):
         self.sr = sr
         self.blocksize = blocksize
+        self.notify = notify or _warn
+        self.overflows = 0            # PortAudio: blocks where samples were lost
+        self._warned_overflow = -1e9
         self._pulse: _PulseStream | None = None
         self._stream = None
         if source:
@@ -218,7 +221,14 @@ class Input:
                 if raw:
                     return np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
                 self._pulse.recover()  # EOF: parec died (server restart?) - EOFError once closed
-        data, _overflow = self._stream.read(self.blocksize)
+        data, overflow = self._stream.read(self.blocksize)
+        if overflow:
+            self.overflows += 1
+            now = time.monotonic()
+            if now - self._warned_overflow > 60:
+                self._warned_overflow = now
+                self.notify("the microphone dropped some audio (the computer was busy); "
+                            "words may be misheard")
         return data[:, 0].copy()
 
     def close(self) -> None:

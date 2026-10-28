@@ -51,7 +51,9 @@ jobs:
     name: e2e · Arch Linux (install.sh, PipeWire)
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    container: archlinux:latest
+    container:
+      image: archlinux:latest
+      options: --cap-add=SYS_NICE --ulimit rtprio=99
     steps:
       - name: system packages (what an Arch desktop already has)
         run: |

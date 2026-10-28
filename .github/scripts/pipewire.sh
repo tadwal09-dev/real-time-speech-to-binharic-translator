@@ -16,6 +16,12 @@ start() {
   sleep 0.5
   (wireplumber >>"$LOG" 2>&1 &)
   (pipewire-pulse >>"$LOG" 2>&1 &)
+  sleep 0.5
+  # a desktop gives PipeWire realtime priority (rtkit), so it never misses a
+  # cycle under load; do the same where the container allows it
+  for p in $(pgrep -x pipewire) $(pgrep -x pipewire-pulse); do
+    sudo -n chrt -f -p 20 "$p" 2>/dev/null && echo "realtime priority for $(ps -o comm= -p "$p")" || true
+  done
   for _ in $(seq 100); do pactl info >/dev/null 2>&1 && { pactl info | grep -E "Server Name"; return 0; }; sleep 0.1; done
   echo "PipeWire didn't start:"; cat "$LOG"; return 1
 }
