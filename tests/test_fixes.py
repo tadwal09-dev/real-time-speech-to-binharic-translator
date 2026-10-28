@@ -401,7 +401,7 @@ def test_latency_report_uses_the_start_delay_not_the_buffer():
     now = time.monotonic()
     tr._queue_text("hello", True, meta=dict(stopped_at=now, stt_ms=0.0, speculative=False))
     tr._play_text(Out(), *tr._take_pending())
-    assert 100 <= sent[0]["latency_ms"] < 240, sent[0]["latency_ms"]
+    assert 80 <= sent[0]["latency_ms"] < 240, sent[0]["latency_ms"]  # (Windows' clock ticks every ~16 ms)
     assert tr._mute_until - time.monotonic() > 0.25 + 0.4 - 0.1  # ...but the mic waits for the whole buffer
 
 

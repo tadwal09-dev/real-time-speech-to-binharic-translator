@@ -90,3 +90,68 @@ def test_mic_down_removes_the_source_before_the_sink(monkeypatch):
         raise AssertionError(args)
     monkeypatch.setattr(pulse, "_pactl", pactl)
     assert pulse.mic_down() == 2 and not mods
+
+
+def test_stream_device_finds_our_stream_by_process(monkeypatch):
+    import subprocess
+    lists = {
+        "sink-inputs": [{"index": 75, "sink": 92, "properties": {"application.process.id": "4321"}},
+                        {"index": 80, "sink": 54, "properties": {"application.process.id": "999"}}],
+        "sinks": [{"index": 54, "name": "binharic_out"}, {"index": 92, "name": "alsa_output.pci.analog-stereo"}],
+        "source-outputs": [{"index": 120, "source": 102, "properties": {"application.process.id": "4321"}}],
+        "sources": [{"index": 102, "name": "alsa_input.usb-Blue_Yeti.analog-stereo"}],
+    }
+
+    def pactl(*args):
+        assert args[:3] == ("-f", "json", "list")
+        return json.dumps(lists[args[3]])
+    monkeypatch.setattr(pulse, "_pactl", pactl)
+    assert pulse.stream_device(4321, playback=True) == (75, "alsa_output.pci.analog-stereo")
+    assert pulse.stream_device(999, playback=True) == (80, "binharic_out")
+    assert pulse.stream_device(4321, playback=False) == (120, "alsa_input.usb-Blue_Yeti.analog-stereo")
+    assert pulse.stream_device(1, playback=True) is None
+
+    def broken(*args):
+        raise subprocess.CalledProcessError(1, "pactl")  # e.g. a pactl without -f json
+    monkeypatch.setattr(pulse, "_pactl", broken)
+    assert pulse.stream_device(4321, playback=True) is None
+
+
+def test_a_stream_the_sound_server_misroutes_is_moved_back(monkeypatch):
+    # regression: right after a PipeWire restart, the session manager linked the
+    # reconnected screech to the default speakers instead of binharic_out, so the
+    # Binharic Mic stayed silent and the screech played out loud
+    import time
+
+    from binharic import audio
+    where = {"device": "binharic_out"}
+    moves, notes, asked = [], [], []
+
+    def stream_device(pid, playback):
+        asked.append(pid)
+        return 75, where["device"]
+
+    def move_stream(index, device, playback):
+        moves.append((index, device, playback))
+        where["device"] = device
+    monkeypatch.setattr(pulse, "stream_device", stream_device)
+    monkeypatch.setattr(pulse, "move_stream", move_stream)
+    monkeypatch.setattr(audio._PulseStream, "WATCH_SECONDS", 3.0)
+    s = audio._PulseStream([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"], "play to 'binharic_out'",
+                           playback=True, notify=notes.append, device="binharic_out")
+    try:
+        time.sleep(1.2)
+        assert moves == [] and asked and set(asked) == {s.proc.pid}  # where it belongs: left alone
+        where["device"] = "alsa_output.pci.analog-stereo"  # the sound server restarts...
+        s.proc.kill()
+        s.recover()                                        # ...binharic reconnects...
+        end = time.monotonic() + 3
+        while not moves and time.monotonic() < end:
+            time.sleep(0.05)
+        assert moves == [(75, "binharic_out", True)]       # ...and puts the stream back
+        assert asked[-1] == s.proc.pid
+        assert any("moved it back to 'binharic_out'" in n for n in notes), notes
+        time.sleep(1.2)
+        assert len(moves) == 1
+    finally:
+        s.close()

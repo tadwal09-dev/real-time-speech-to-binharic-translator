@@ -133,6 +133,24 @@ def _info(kind: str) -> list[dict]:
             return []
 
 
+def stream_device(pid: int, playback: bool) -> tuple[int, str | None] | None:
+    """Where the stream that process ``pid`` opened is connected: (stream index,
+    sink or source name). None if it isn't listed (yet) or pactl can't tell."""
+    kind, devices, key = ("sink-inputs", "sinks", "sink") if playback else ("source-outputs", "sources", "source")
+    try:
+        for st in json.loads(_pactl("-f", "json", "list", kind)):
+            if str(st.get("properties", {}).get("application.process.id")) == str(pid):
+                names = {d.get("index"): d.get("name") for d in json.loads(_pactl("-f", "json", "list", devices))}
+                return st["index"], names.get(st.get(key))
+    except Exception:  # an old pactl without -f json, or the server is going away
+        return None
+    return None
+
+
+def move_stream(index: int, device: str, playback: bool) -> None:
+    _pactl("move-sink-input" if playback else "move-source-output", str(index), device)
+
+
 def describe(name: str | None, kind: str) -> str:
     for d in _info(kind):
         if d["name"] == name:

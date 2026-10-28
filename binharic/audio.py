@@ -50,18 +50,23 @@ class _PulseStream:
     """A pacat/parec child process that is checked at start and restarted if
     the sound server goes away."""
 
+    WATCH_SECONDS = 10.0  # how long after connecting we check where the stream went
+
     def __init__(self, cmd: list[str], what: str, playback: bool,
                  notify: Callable[[str], None] | None = None,
-                 before_reconnect: Callable[[], None] | None = None):
+                 before_reconnect: Callable[[], None] | None = None,
+                 device: str | None = None):
         self.cmd = cmd
         self.what = what            # e.g. "play to 'binharic_out'"
         self.playback = playback
+        self.device = device
         self.notify = notify or _warn
         self.before_reconnect = before_reconnect
         self.closed = False
         self._errors: collections.deque[str] = collections.deque(maxlen=4)
         self.proc = self._spawn()
         self._check_started()
+        self._watch()
 
     def _spawn(self) -> subprocess.Popen:
         proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE if self.playback else subprocess.DEVNULL,
@@ -93,6 +98,31 @@ class _PulseStream:
         time.sleep(0.05)  # let the stderr reader catch the message
         raise RuntimeError(f"can't {self.what}: {self.error()}")
 
+    def _watch(self) -> None:
+        """PipeWire's session manager can connect a new stream to the default
+        device instead of the one we named, when it is starting up at the same
+        moment (a sound-server restart, logging in). The screech would then play
+        on your speakers while the Binharic Mic stays silent. Watch where the
+        stream went for a while, and move it back."""
+        if not self.device:
+            return
+        proc = self.proc
+
+        def run():
+            from . import pulse
+            end = time.monotonic() + self.WATCH_SECONDS
+            while time.monotonic() < end and self.proc is proc and not self.closed and proc.poll() is None:
+                found = pulse.stream_device(proc.pid, self.playback)
+                if found and found[1] and found[1] != self.device:
+                    try:
+                        pulse.move_stream(found[0], self.device, self.playback)
+                        self.notify(f"the sound server connected binharic to '{found[1]}'; "
+                                    f"moved it back to '{self.device}'")
+                    except Exception:
+                        pass  # gone meanwhile; the next check tells
+                time.sleep(0.5)
+        threading.Thread(target=run, daemon=True).start()
+
     def recover(self) -> None:
         """Called when the stream broke. Reconnect, or raise if that's hopeless."""
         if self.closed:
@@ -116,6 +146,7 @@ class _PulseStream:
                 reason = str(e)
                 continue
             self.notify("audio reconnected")
+            self._watch()
             return
         if self.closed:
             raise EOFError
@@ -161,7 +192,7 @@ class Output:
                 [_require("pacat"), "--playback", f"--device={sink}", "--raw", "--format=s16le",
                  f"--rate={sr}", "--channels=1", f"--latency-msec={self.PACAT_LATENCY_MS}",
                  "--client-name=binharic", "--stream-name=binharic"],
-                f"play to '{sink}'", playback=True, notify=notify, before_reconnect=before_reconnect)
+                f"play to '{sink}'", playback=True, notify=notify, before_reconnect=before_reconnect, device=sink)
         else:
             import sounddevice as sd
             self._stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32",
@@ -214,7 +245,7 @@ class Input:
             self._pulse = _PulseStream(
                 [_require("parec"), f"--device={source}", "--raw", "--format=s16le",
                  f"--rate={sr}", "--channels=1", "--latency-msec=20", "--client-name=binharic"],
-                f"record from '{source}'", playback=False, notify=notify)
+                f"record from '{source}'", playback=False, notify=notify, device=source)
         else:
             import sounddevice as sd
             # "high": with "low", Windows' MME gets a few tiny buffers and drops input

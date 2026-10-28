@@ -72,6 +72,19 @@ class LinuxRig:
     def pactl(*args: str) -> str:
         return subprocess.run(["pactl", *args], check=True, capture_output=True, text=True).stdout
 
+    @classmethod
+    def describe(cls) -> str:
+        """The sound server's devices and links, for a failure message."""
+        out = []
+        for what in ("modules", "sinks", "sources", "source-outputs", "sink-inputs"):
+            try:
+                out.append(f"-- {what}\n" + cls.pactl("list", "short", what))
+            except (subprocess.CalledProcessError, OSError) as e:
+                out.append(f"-- {what}: {e}")
+        if shutil.which("pw-link"):
+            out.append("-- links\n" + subprocess.run(["pw-link", "-l"], capture_output=True, text=True).stdout)
+        return "\n".join(out)
+
     def server(self) -> str:
         info = self.pactl("info")
         return "PipeWire" if "PipeWire" in info else "PulseAudio"
@@ -149,7 +162,7 @@ class LinuxRig:
             self._noise.kill()
         cmd = os.environ.get("BINHARIC_E2E_RESTART")  # PipeWire: how this machine restarts it
         if cmd:
-            subprocess.run(cmd, shell=True, check=True)
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)  # (errors still show)
         else:
             subprocess.run(["pulseaudio", "-k"], check=False)
             time.sleep(1.5)

@@ -62,6 +62,26 @@ everything does". Done in this session:
   - `binharic mic down` failed on PulseAudio (the remap source must go first).
   - iSH: a second file in the same second sorted before the first.
   - A mic that drops audio (input overflow) is now reported.
+  - `decode` and `--hear` announced "listening" before any audio flowed, so a message sent
+    right then was missed.
+  - Windows: test mode's speaker stream was left unfed between screeches, and the start-up
+    glitch mangled the next sync chirp. `say` now starts with a short silence for the same
+    reason. PortAudio input uses high latency (low dropped input on MME).
+  - The pacat playback buffer went from 100 to 250 ms so a busy CPU can't starve a screech.
+    It measured no later start. `Output.start_latency` is used for the latency report.
+  - GUI: on a 768 px screen the type-to-screech row was cut off (window size, packing order).
+  - With VB-Audio's CABLE-A/B installed, the plain CABLE Input is still the one used.
+  - After a PipeWire restart, the session manager sometimes linked the reconnected screech
+    stream to the default speakers instead of `binharic_out`: the Binharic Mic went silent
+    and the screech played out loud. pacat/parec streams now check where they were linked
+    for 10 s after (re)connecting and move themselves back (`pulse.stream_device`).
+- `BINHARIC_DUMP_INPUT=folder` saves what every `Input` recorded as WAVs. It's for
+  diagnosing a user's mic, and the e2e suite keeps these dumps for failed cases.
+- The Windows CI rig's test mic (VB-Audio Hi-Fi Cable) has mismatched rates out of the box
+  (48 kHz playback end, 44.1 kHz recording end) and warps everything. `windows-audio.ps1`
+  sets the recording end to 48 kHz through IPolicyConfig. `windows-audio-check.py` refuses
+  to run the tests if a cable doesn't carry a sweep faithfully (VB-Cable measured 1.000; the
+  unfixed Hi-Fi Cable 0.073).
 - Known environment limit: PipeWire in a container has no realtime priority and misses
   cycles (xruns) often. The inserted silence corrupts a screech. A desktop gives PipeWire
   realtime priority (rtkit). CI tries to do the same (`pipewire.sh` uses `chrt`, and the

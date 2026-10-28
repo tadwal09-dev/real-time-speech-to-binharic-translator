@@ -750,7 +750,8 @@ def survives_a_sound_server_restart(ctx):
               f"mic and output should both reconnect:\n{lay.text[-2000:]}")
         time.sleep(1)
         audio = say_and_record(ctx, lay, "hello")
-        check(similar(" ".join(texts(audio)), PHRASES["hello"]), f"after the restart: {texts(audio)}:\n{lay.text[-2000:]}")
+        check(similar(" ".join(texts(audio)), PHRASES["hello"]),
+              f"after the restart: {texts(audio)}:\n{lay.text[-2000:]}\n{ctx.rig.describe()}")
 
 
 @case({"linux"})
