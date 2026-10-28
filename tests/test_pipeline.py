@@ -129,7 +129,7 @@ class FakeIn:
         return self
 
     def read(self):
-        time.sleep(0.001)
+        time.sleep(self.bs / core.SR)  # a mic delivers audio in real time (and FakeOut takes it so)
         b = self.sig[self.i:self.i + self.bs]
         self.i += self.bs
         return b if len(b) == self.bs else np.zeros(self.bs, np.float32)
@@ -153,6 +153,9 @@ class FakeOut:
 
     def write(self, s):
         self.blocks.append(np.asarray(s, np.float32).copy())
+        # a sound card takes audio in real time; without this the output thread
+        # wrote minutes of silence per second, and decoding that took 5 minutes on Windows
+        time.sleep(len(self.blocks[-1]) / core.SR)
 
     def close(self):
         pass
