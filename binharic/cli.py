@@ -102,7 +102,7 @@ def _settings(args):
         send_mode=LIVE if args.live else PHRASE,
         mode=args.mode, key=_key(args.key), speed=args.speed, volume=args.volume,
         passthrough=args.passthrough, engine=args.engine, model=model, live_model=live_model,
-        device=args.device, beam=beam, partials=partials, language=args.language, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
+        device=args.device, beam=beam, decoys=args.decoys, partials=partials, language=args.language, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
         sink=sink, source=pulse.resolve_source(args.source) or (cfg.get("source") if not args.input_device else None),
         output_device=args.output_device, input_device=args.input_device or cfg.get("input_device"),
         duplex=args.duplex, end_ms=pause,
@@ -258,7 +258,10 @@ def cmd_say(args):
             say_line("[green]⚙ queued in the running binharic[/] [dim](its mode, key and speed apply; "
                      "--direct plays it yourself)[/]")
             return
-    audio = modem.encode_text(text, args.mode, key=_key(args.key), sr=SR, speed=args.speed, volume=args.volume)
+    if args.decoys and not _key(args.key):
+        sys.exit("--decoys needs a key (-k): without one, anyone can read the real message anyway")
+    audio = modem.encode_text(text, args.mode, key=_key(args.key), sr=SR, speed=args.speed, volume=args.volume,
+                              decoys=args.decoys)
     if args.wav:
         from .audio import write_wav
         write_wav(args.wav, audio, SR)
@@ -288,6 +291,12 @@ def cmd_decode(args):
         from .ish import readable
         sig, sr = read_wav(readable(args.wav))
         msgs = modem.decode_audio(sig, sr, args.mode, key=key, speed=args.speed, threshold=args.threshold)
+        if key:
+            skipped = sum(m.locked for m in msgs)
+            msgs = [m for m in msgs if not m.locked]
+            if skipped:
+                say_line(f"[dim]({skipped} frame(s) don't match your key: decoys, or a different key)[/]",
+                         f"({skipped} frame(s) don't match your key: decoys, or a different key)")
         if not msgs:
             say_line("[yellow]no transmissions found[/]", "no transmissions found")
             sys.exit(1)
@@ -307,6 +316,8 @@ def cmd_decode(args):
     say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
 
     def show(m):
+        if m.locked and key:
+            return  # a decoy (or a different key)
         tag = modem.MODES_BY_ID[m.mode_id].name if m.mode_id in modem.MODES_BY_ID else "?"
         style = "yellow" if m.locked else "bold green"
         # decoded text is whatever someone sent: never let it be read as markup
@@ -476,6 +487,8 @@ def _run_options(p, inherit: bool = False):
     g.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic",
                    help="binharic = Mechanicus screech, hex = 16 tones, binary = 0/1 beeps")
     g.add_argument("-k", "--key", help="shared cant-key; only holders can read you (or set BINHARIC_KEY)")
+    g.add_argument("--decoys", type=_ranged(int, 0, 8, "decoys"), default=0,
+                   help="hide each encrypted message among N gibberish chirps (0-8, needs -k)")
     g.add_argument("--speed", type=SPEED, default=1.0, help="tempo multiplier 0.25-4, listeners must match")
     g.add_argument("--volume", type=VOLUME, default=0.6, help="0.01-1")
 
@@ -553,6 +566,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--speed", type=SPEED, default=1.0)
     s.add_argument("--volume", type=VOLUME, default=0.6)
     s.add_argument("--wav", help="write to this WAV file instead of playing")
+    s.add_argument("--decoys", type=_ranged(int, 0, 8, "decoys"), default=0,
+                   help="hide the message among N gibberish chirps (needs -k)")
     s.add_argument("--direct", action="store_true", help="play it yourself even if a layer is running")
     s.add_argument("--sink", default="auto", help="auto (Binharic Mic if set up), default (your speakers) or a name")
     s.add_argument("--output-device")

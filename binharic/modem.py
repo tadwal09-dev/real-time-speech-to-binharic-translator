@@ -12,6 +12,7 @@ decoder locks onto, followed by one tone per symbol:
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 import numpy as np
@@ -182,13 +183,32 @@ def modulate(frame: bytes, spec: ModeSpec, sr: int = DEFAULT_SR, volume: float =
     return np.concatenate([lead_in(sr, volume), modulate_body(frame, spec, sr, volume, seed)])
 
 
+MAX_DECOYS = 8
+
+
+def frames_with_decoys(text: str, mode_id: int, key: str | None, decoys: int = 0) -> list[tuple[bool, bytes]]:
+    """[(is_real, frame)]: the real frame hidden at a random place among
+    ``decoys`` gibberish frames of similar (random) length. Needs a key."""
+    real = codec.build_frame(text, mode_id, key)
+    if not key or decoys <= 0:
+        return [(True, real)]
+    rng = random.SystemRandom()
+    n = len(text.encode("utf-8"))
+    out = [(False, codec.build_decoy(mode_id, max(1, int(n * rng.uniform(0.5, 1.6)) + rng.randint(0, 6))))
+           for _ in range(min(decoys, MAX_DECOYS))]
+    out.insert(rng.randint(0, len(out)), (True, real))
+    return out
+
+
 def encode_text(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,
-                speed: float = 1.0, volume: float = 0.8) -> np.ndarray:
+                speed: float = 1.0, volume: float = 0.8, decoys: int = 0) -> np.ndarray:
     """Text -> audio. Long text becomes several frames back to back (each
-    with its own sync chirp), so nothing is ever cut off."""
+    with its own sync chirp), so nothing is ever cut off. With a key,
+    ``decoys`` gibberish frames per chunk hide which chirp is the real one."""
     spec = get_mode(mode, speed)
     chunks = codec.split_text(text) or [""]
-    return np.concatenate([modulate(codec.build_frame(c, spec.id, key), spec, sr, volume) for c in chunks])
+    return np.concatenate([modulate(frame, spec, sr, volume)
+                           for c in chunks for _, frame in frames_with_decoys(c, spec.id, key, decoys)])
 
 
 def encode_body(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,

@@ -83,6 +83,17 @@ def build_frame(text: str, mode_id: int, key: str | None = None, nonce: bytes | 
     return body + binascii.crc_hqx(body, 0xFFFF).to_bytes(2, "big")
 
 
+def build_decoy(mode_id: int, length: int) -> bytes:
+    """A frame that looks exactly like an encrypted message (valid magic, nonce,
+    key check field, length and CRC) but carries random bytes. Without the key
+    it can't be told apart from a real one; with the key its key check fails,
+    so the receiver drops it."""
+    head = bytearray([MAGIC | (mode_id << 1) | 1]) + os.urandom(NONCE_LEN + KEYCHECK_LEN)
+    head += length.to_bytes(2, "big")
+    body = bytes(head) + os.urandom(length)
+    return body + binascii.crc_hqx(body, 0xFFFF).to_bytes(2, "big")
+
+
 def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None) -> tuple[Message, int]:
     """Parse a frame from the start of ``data``.
 

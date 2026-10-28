@@ -87,6 +87,11 @@ def run(tr: Translator) -> None:
     tk.Button(keyrow, text="Set", command=lambda: tr.set_key(key_var.get()), bg=RED, fg="white", bd=0,
               activebackground=RED_HI, font=ui, padx=10, cursor="hand2").pack(side="left", padx=6)
     label(keyrow, "only key holders can read you", bg=PANEL).pack(side="left")
+    decoy_var = tk.BooleanVar(value=tr.s.decoys > 0)
+    tk.Checkbutton(panel, text="Hide it among decoy chirps (only key holders can tell which is real)",
+                   variable=decoy_var, command=lambda: tr.set_decoys(3 if decoy_var.get() else 0), bg=PANEL,
+                   fg=FG, selectcolor=BG, activebackground=PANEL, activeforeground=FG, font=ui,
+                   highlightthickness=0).grid(row=3, column=1, sticky="w")
 
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -116,21 +121,21 @@ def run(tr: Translator) -> None:
         shown.configure(text=fmt(value))  # show the real value, unrounded
         building = False
 
-    slider(3, "Speed", 0.5, 3.0, 0.25, tr.s.speed, lambda v: f"{v:.2f}×", tr.set_speed)
-    slider(4, "Pause to send", 300, 2000, 50, tr.s.end_ms, lambda v: f"{int(v)} ms",
+    slider(4, "Speed", 0.5, 3.0, 0.25, tr.s.speed, lambda v: f"{v:.2f}×", tr.set_speed)
+    slider(5, "Pause to send", 300, 2000, 50, tr.s.end_ms, lambda v: f"{int(v)} ms",
            lambda v: tr.set_end_ms(int(v)))
 
     pass_var = tk.BooleanVar(value=tr.s.passthrough)
     tk.Checkbutton(panel, text="Pass my normal voice through while OFF", variable=pass_var,
                    command=lambda: tr.set_passthrough(pass_var.get()), bg=PANEL, fg=FG, selectcolor=BG,
                    activebackground=PANEL, activeforeground=FG, font=ui, highlightthickness=0
-                   ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                   ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     test_var = tk.BooleanVar(value=tr.s.test)
     tk.Checkbutton(panel, text="Test mode: play the screech on my speakers and decode it back (timed)",
                    variable=test_var, command=lambda: tr.set_test(test_var.get()), bg=PANEL, fg=AMBER,
                    selectcolor=BG, activebackground=PANEL, activeforeground=AMBER, font=ui,
-                   highlightthickness=0).grid(row=6, column=0, columnspan=2, sticky="w")
+                   highlightthickness=0).grid(row=7, column=0, columnspan=2, sticky="w")
 
     # -- meter + live text --------------------------------------------------
     live = tk.Frame(root, bg=BG)
@@ -215,6 +220,7 @@ def run(tr: Translator) -> None:
         mode_var.set(s.mode)
         pass_var.set(s.passthrough)
         test_var.set(s.test)
+        decoy_var.set(s.decoys > 0)
         engine_lbl.configure(text=tr.engine_name if tr.ready else "loading speech model…")
 
     def poll():

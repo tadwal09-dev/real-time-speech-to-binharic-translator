@@ -239,3 +239,46 @@ def test_off_means_off_even_for_already_queued_speech(monkeypatch, tmp_path):
     tr.say("typed while off")  # typing still works while OFF
     tr._play_text(Out(), *tr._take_pending())
     assert played
+
+
+# -- decoy chirps --------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", list(modem.MODES))
+def test_decoys_hide_the_real_message(mode):
+    a = modem.encode_text("meet at the forge", mode, key="cog", decoys=3)
+    blind = modem.decode_audio(a, 48000)
+    assert len(blind) == 4 and all(m.locked for m in blind)  # 4 identical-looking encrypted frames
+    keyed = [m.text for m in modem.decode_audio(a, 48000, key="cog") if not m.locked]
+    assert keyed == ["meet at the forge"]
+
+
+def test_decoys_land_at_random_places():
+    positions = {[real for real, _ in modem.frames_with_decoys("x", 2, "k", 3)].index(True) for _ in range(60)}
+    assert len(positions) > 1
+
+
+def test_decoys_need_a_key():
+    assert len(modem.frames_with_decoys("x", 2, None, 5)) == 1
+    with pytest.raises(SystemExit, match="needs a key"):
+        cli.cmd_say(cli.build_parser().parse_args(["say", "--decoys", "2", "--wav", "/dev/null", "x"]))
+
+
+def test_layer_hides_decoys_from_key_holders(monkeypatch, tmp_path):
+    tr = core.Translator(core.Settings(control_socket=False, key="cog", decoys=2))
+    played = []
+
+    class Out:
+        latency = 0.0
+        needs_feeding = False
+
+        def write(self, s):
+            played.append(np.asarray(s))
+
+    events = []
+    tr.subscribe(lambda k, e: k == "sent" and events.append(e))
+    tr.say("hidden words")
+    tr._play_text(Out(), *tr._take_pending())
+    audio = np.concatenate(played)
+    assert events[0]["decoys"] == 2
+    assert len(modem.decode_audio(audio, 48000)) == 3
+    assert [m.text for m in modem.decode_audio(audio, 48000, key="cog") if not m.locked] == ["hidden words"]

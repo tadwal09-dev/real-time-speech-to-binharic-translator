@@ -59,6 +59,7 @@ class Settings:
     end_ms: int = 700           # silence that ends a phrase
     hear: str | None = None     # source to decode incoming binharic from
     hear_key: str | None = None
+    decoys: int = 0             # gibberish frames hiding each encrypted message (needs a key)
     beam: int = 5               # whisper beam size for the final pass (1 = fastest)
     language: str | None = None # whisper language for multilingual models (None = detect)
     partials: bool = True       # show what you're saying while you say it (phrase mode)
@@ -230,6 +231,15 @@ class Translator:
     def set_key(self, key: str | None) -> None:
         self.s.key = key or None
         self.log("key set" if key else "key cleared: anyone with the decoder can read you")
+        self._changed()
+
+    def set_decoys(self, n: int) -> None:
+        self.s.decoys = max(0, min(modem.MAX_DECOYS, int(n)))
+        if self.s.decoys and not self.s.key:
+            self.log("decoys need a key: set one, or they're not sent (without a key anyone can read you anyway)",
+                     "warn")
+        else:
+            self.log(f"hiding each message among {self.s.decoys} decoy chirps" if self.s.decoys else "decoys off")
         self._changed()
 
     def set_test(self, on: bool, air: bool | None = None) -> None:
@@ -593,17 +603,20 @@ class Translator:
                 # in the middle (the speaker running dry while we compute)
                 # corrupts the screech, so this is worth the ~50 ms
                 t = time.monotonic()
-                body = modem.encode_body(chunk, s.mode, key=s.key, sr=SR, speed=s.speed, volume=s.volume)
+                spec = modem.get_mode(s.mode, s.speed)
+                frames = modem.frames_with_decoys(chunk, spec.id, s.key, s.decoys)
+                bodies = [(real, modem.modulate_body(f, spec, SR, s.volume)) for real, f in frames]
+                body = next(b for real, b in bodies if real)
                 synth_ms = (time.monotonic() - t) * 1000
                 first_sound = time.monotonic() + out.latency  # when it actually leaves the speaker
+                audio = np.concatenate([x for _, b in bodies for x in (lead, b)])
                 info = dict(text=chunk, hex=codec.to_hex(chunk), binary=codec.to_binary(chunk),
-                            seconds=(len(lead) + len(body)) / SR, mode=s.mode, synth_ms=synth_ms,
-                            test=s.test)
+                            seconds=len(audio) / SR, mode=s.mode, synth_ms=synth_ms,
+                            test=s.test, decoys=len(bodies) - 1)
                 if n == 0 and "stopped_at" in meta:
                     info.update(latency_ms=(first_sound - meta["stopped_at"]) * 1000,
                                 stt_ms=meta["stt_ms"], speculative=meta["speculative"])
                 self.emit("sent", **info)
-                audio = np.concatenate([lead, body])
                 if s.test:
                     self._verify(chunk, np.concatenate([lead, body]), s.mode, s.key, s.speed)
                 step = BLOCK * 5  # 100 ms writes: fewer wake-ups for a busy CPU to miss
@@ -635,6 +648,8 @@ class Translator:
             except queue.Empty:
                 if dec is not None and not self.screeching.is_set() and time.monotonic() > self._mute_until:
                     for m in dec.flush():  # the tail of the screech may still be unscanned
+                        if m.locked and self.s.key:
+                            continue
                         self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked,
                                   decode_ms=0.0)
                     dec = None  # this attempt is over; start clean for the next screech
@@ -642,6 +657,8 @@ class Translator:
             if dec is None:
                 dec = modem.StreamDecoder(SR, "auto", key=self.s.key, speed=self.s.speed)
             for m in dec.feed(block):
+                if m.locked and self.s.key:
+                    continue  # a decoy
                 self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
 
     def _hear_loop(self):
@@ -654,6 +671,8 @@ class Translator:
             except EOFError:
                 break
             for m in dec.feed(block):
+                if m.locked and (self.s.hear_key or self.s.key):
+                    continue  # doesn't match our key: a decoy (or someone else's key)
                 name = modem.MODES_BY_ID.get(m.mode_id)
                 self.emit("received", text=m.display(), locked=m.locked,
                           mode=name.name if name else "?")
@@ -715,6 +734,8 @@ class Translator:
             self.set_mode(arg)
         elif cmd == "passthrough":
             self.set_passthrough(arg != "off" if arg else not self.s.passthrough)
+        elif cmd == "decoys":
+            self.set_decoys(int(arg or 0))
         elif cmd == "test":
             self.set_test(arg != "off" if arg else not self.s.test)
         elif cmd == "say":

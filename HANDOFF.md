@@ -42,6 +42,7 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 
   The installers now run `fix` at the end. `doctor` stays as a read-only check and points
   to `fix`.
+- **Decoy chirps** (`--decoys N`, GUI checkbox under Key, TUI `c`, control `decoys N`): `codec.build_decoy` + `modem.frames_with_decoys` hide each encrypted frame among look-alike gibberish frames; receivers holding a key drop frames that fail the key check.
 - **Ctrl+C bug fixed:** the pacat/parec children now run with `start_new_session=True`.
 - **Faster by default:** without a usable GPU, `listen`, `test`, `gui` and `tui` use the
   `--fast` setup automatically (`base.en` only, greedy). `--accurate` restores `small.en`.

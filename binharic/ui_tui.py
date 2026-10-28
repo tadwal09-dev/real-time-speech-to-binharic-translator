@@ -13,7 +13,7 @@ from .core import Translator
 from .stt import LIVE
 
 KEYS = [("space", "on/off"), ("l", "finish ⇄ live"), ("x", "test"), ("m", "mode"), ("k", "key"),
-        ("t", "type"), ("p", "pass"), ("+/-", "speed"), ("q", "quit")]
+        ("c", "decoys"), ("t", "type"), ("p", "pass"), ("+/-", "speed"), ("q", "quit")]
 
 
 class Dashboard:
@@ -78,7 +78,7 @@ class Dashboard:
         send = "AS I TALK" if s.send_mode == LIVE else "AFTER I FINISH"
         x = 1
         for label, val, hi in [("send", send, True), ("mode", s.mode, False), ("speed", f"{s.speed:.1f}x", False),
-                               ("key", "set" if s.key else "none", bool(s.key)),
+                               ("key", ("set" + (f" +{s.decoys} decoys" if s.decoys else "")) if s.key else "none", bool(s.key)),
                                ("out", s.sink or self.tr.speakers_label, False),
                                ("passthrough", "on" if s.passthrough else "off", False)]:
             put(2, x, f"{label}: ", curses.A_DIM)
@@ -163,6 +163,8 @@ class Dashboard:
             tr.set_speed(tr.s.speed + 0.25)
         elif ch == ord("-"):
             tr.set_speed(tr.s.speed - 0.25)
+        elif ch == ord("c"):
+            tr.set_decoys(0 if tr.s.decoys else 3)
         elif ch == ord("k"):
             key = self.prompt(scr, "key (empty clears): ", secret=True)
             if key is not None:

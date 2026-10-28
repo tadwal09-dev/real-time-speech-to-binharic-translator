@@ -240,6 +240,21 @@ With `-k KEY` (or `BINHARIC_KEY`, or the GUI key field), the text is scrambled b
 becomes sound. Someone decoding without the key gets `[encrypted, N bytes …]`. Someone
 with it gets the words. Without a key, anyone running the decoder can read it.
 
+### Decoy chirps
+
+`--decoys N` (or *Hide it among decoy chirps* next to the GUI's key field, or `c` in the
+TUI) sends each encrypted message hidden among N gibberish frames. They chirp exactly like
+real encrypted messages and have random lengths, and the real one sits at a random place
+among them. Without the key, all of them look the same (`[encrypted …]`), so a listener
+can't tell which one is real or how long it is. With the key, the decoys fail the key
+check and are dropped silently; `binharic decode` says how many it skipped. It needs a
+key (`-k`), and each decoy adds roughly a message's length of screech.
+
+```sh
+binharic listen -k "my cant key" --decoys 3
+binharic say -k "my cant key" --decoys 3 "meet at the forge"
+```
+
 > The key scrambling is a SHA-256 keystream. It keeps casual listeners out. It is not
 > audited cryptography.
 
