@@ -127,7 +127,7 @@ def _translator(args):
 def _run_ui(run, tr, **kw):
     # `systemctl --user stop`, closing the terminal, `kill`: shut down cleanly
     # (close the audio, remove the control socket) instead of just dying
-    # Windows: Ctrl+Break, or closing the console window, arrives as SIGBREAK
+    # Windows: Ctrl+Break arrives as SIGBREAK
     for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
         sig = getattr(signal, name, None)
         if sig is not None:
@@ -342,7 +342,6 @@ def cmd_decode(args):
     mic = Input(SR, source=source, device=device)
     dec = modem.StreamDecoder(SR, args.mode, key=key, speed=args.speed, threshold=args.threshold)
     where = pulse.describe(source, "sources") if source else args.input_device or "the default mic"
-    say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
 
     def show(m):
         if m.locked and key:
@@ -353,6 +352,10 @@ def cmd_decode(args):
         say_line(f"[{style}]▼ {esc('[' + tag + ']')} {esc(m.display())}[/]", f"<< [{tag}] {m.display()}")
 
     try:
+        first = mic.read()  # say "listening" once audio really arrives, not before
+        say_line(f"[cyan]⚙ listening for binharic on {esc(where)}… (Ctrl+C stops)[/]")
+        for m in dec.feed(first):
+            show(m)
         while True:
             for m in dec.feed(mic.read()):
                 show(m)

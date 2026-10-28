@@ -23,7 +23,52 @@ All of that is built and was tested against a simulated desktop (see below). **I
 yet worked end to end on the user's real machine.** The latest report, below, is the
 current blocker.
 
-## Status after the latest session (Windows, iSH, `binharic fix`, faster default)
+## Status after the latest session (everything tested on Windows, Arch, Ubuntu and iSH)
+
+The user asked to "test every function on Windows and Linux, fix everything, and loop until
+it passes 3 times in a row on all systems, then ship to main and write a file describing what
+everything does". Done in this session:
+
+- **`tests/e2e/`**: an end-to-end suite that drives the real `binharic` command on a real
+  sound system: every command, the layer in every mode and privacy level, control commands,
+  signals, a crash and restart, a sound-server restart, test mode over the air, both
+  engines, and the real GUI and TUI (`gui_driver.py`, `tui_driver.py`). `rig.py` is the
+  fake desktop: null sinks in PipeWire/PulseAudio, VB-Audio cables on Windows.
+- **CI** (`.github/workflows/ci.yml`):
+  - unit tests on Ubuntu and Windows, Python 3.10/3.12/3.14
+  - e2e on Windows, installed with `install.ps1`; `.github/scripts/windows-audio.ps1`
+    installs VB-Cable + Hi-Fi Cable and allows mic access
+  - e2e on Arch Linux with PipeWire, installed with `install.sh`
+  - e2e on Ubuntu with PulseAudio
+  - e2e on 32-bit Alpine as the iSH stand-in, installed with `install-ish.sh`
+  - `workflow_dispatch` with `repeat` runs the suite N times in a row.
+- **`ARCHITECTURE.md`**: the map of the code for agents (modules, threads, events, control
+  protocol, frame format, platforms, tests, recipes, gotchas).
+- Bugs found and fixed (each has a regression test):
+  - **live decoding lost whole messages.** `StreamDecoder` trimmed audio it hadn't searched
+    yet. This affected `decode` live, `--hear` and `test --air`.
+  - **Windows: redirected output crashed** on ✔ ▲ ⚙ (cp1252). `cli.safe_output()` fixes it.
+  - **Windows: VB-Audio's Hi-Fi Cable was taken for VB-Cable**, so the screech went to the
+    wrong cable.
+  - **Windows: test mode heard its own screech.** The output buffers a lot there and the mic
+    unmuted too early, so Whisper hallucinated sentences.
+  - Windows:
+    - ambiguous device names (`decode --input-device`, `say --output-device`)
+    - `--hear` needed PipeWire
+    - `binharic mic` crashed
+    - plain `binharic` opened the TUI instead of the window
+    - stopping took 1.5 s longer
+    - models went to `~/.local/share` instead of `%LOCALAPPDATA%\binharic`
+  - `binharic mic down` failed on PulseAudio (the remap source must go first).
+  - iSH: a second file in the same second sorted before the first.
+  - A mic that drops audio (input overflow) is now reported.
+- Known environment limit: PipeWire in a container has no realtime priority and misses
+  cycles (xruns) often. The inserted silence corrupts a screech. A desktop gives PipeWire
+  realtime priority (rtkit). CI tries to do the same (`pipewire.sh` uses `chrt`, and the
+  container gets `SYS_NICE`). Local docker runs without realtime are flaky for this reason
+  alone.
+
+## Status after the session before (Windows, iSH, `binharic fix`, faster default)
 
 Added in response to the user's report (a Bluetooth-earbud mic that delivers nothing, a
 CUDA download that keeps dropping, and "doctor doesn't work"):
@@ -101,7 +146,7 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 | `binharic/gpu.py` | Loads the CUDA 12 libraries from the pip wheels without `LD_LIBRARY_PATH` |
 | `binharic/ui_cli.py`, `ui_tui.py`, `ui_gui.py` | The log, curses and Tk front ends |
 | `install.sh`, `contrib/` | Installer (pacman, uv, models, mic, doctor, `--uninstall`), user systemd unit, desktop entry |
-| `tests/` | 117 tests; `test_privacy.py` covers the cipher and the three options; `test_platforms.py` covers Windows/iSH/fix with fakes. `test_fixes.py` holds the regressions from the full test pass |
+| `tests/` | Unit tests (`pytest -q tests`); `tests/e2e/` is the end-to-end suite (`python -m tests.e2e.run`), see ARCHITECTURE.md; `test_privacy.py` covers the cipher and the three options; `test_platforms.py` covers Windows/iSH/fix with fakes. `test_fixes.py` holds the regressions from the full test pass |
 
 ## How it was tested (rebuild this; the scripts were in a session scratch folder)
 

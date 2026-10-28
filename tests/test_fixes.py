@@ -323,3 +323,35 @@ def test_dropped_mic_audio_is_reported_once(monkeypatch):
     for _ in range(5):
         mic.read()
     assert mic.overflows == 5 and len(said) == 1 and "dropped" in said[0]
+
+
+def test_hear_announces_itself_only_once_audio_arrives(monkeypatch):
+    # regression: "decoding incoming binharic" was logged before the recording
+    # delivered anything, so a message sent right then was silently missed
+    import threading
+    flowing = threading.Event()
+    logs = []
+
+    class SlowIn:
+        def __init__(self, *a, **k):
+            pass
+
+        def read(self):
+            flowing.wait(5)
+            time.sleep(0.05)
+            return np.zeros(4800, np.float32)
+
+        def close(self):
+            pass
+    monkeypatch.setattr(core, "Input", SlowIn)
+    tr = core.Translator(core.Settings(control_socket=False, hear="friend"))
+    tr._on_pulse = True
+    tr.subscribe(lambda k, e: k == "log" and logs.append(e["text"]))
+    t = threading.Thread(target=tr._hear_loop, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    assert not any("decoding incoming" in m for m in logs)
+    flowing.set()
+    time.sleep(0.3)
+    tr._stop.set()
+    assert any("decoding incoming" in m for m in logs)

@@ -727,12 +727,15 @@ class Translator:
                               device=None if self._on_pulse else self._hear_device,
                               blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
         dec = modem.StreamDecoder(SR, "auto", key=self.s.hear_key or self.s.key, speed=self.s.speed)
-        self.log(f"decoding incoming binharic from {self.s.hear}")
+        announced = False
         while not self._stop.is_set():
             try:
                 block = self._hear_in.read()
             except EOFError:
                 break
+            if not announced:  # only once audio really arrives: earlier messages would be missed
+                announced = True
+                self.log(f"decoding incoming binharic from {self.s.hear}")
             for m in dec.feed(block):
                 if m.locked and (self.s.hear_key or self.s.key):
                     continue  # doesn't match our key: a decoy (or someone else's key)

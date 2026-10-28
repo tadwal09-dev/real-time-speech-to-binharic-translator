@@ -589,6 +589,36 @@ def listen_hex_and_binary_modes(ctx):
 
 
 @case(AUDIO)
+def layer_sound_options(ctx):
+    # --speed (both sides must match), --show, --volume and --duplex
+    with ctx.layer("--speed", "1.5", "--show", "hex", "--volume", "0.3", "--duplex", "full") as lay:
+        st = lay.status()
+        check(st["speed"] == 1.5 and st["full_duplex"] and abs(st["volume"] - 0.3) < 1e-6, st)
+        audio = say_and_record(ctx, lay, "hello")
+        fast = [m.text for m in modem.decode_audio(audio, SR, speed=1.5) if m.text]
+        check(similar(" ".join(fast), PHRASES["hello"]), f"--speed 1.5: {fast}")
+        check(float(np.abs(audio).max()) < 0.4, f"--volume 0.3: peak {np.abs(audio).max():.2f}")
+        hexed = " ".join(f"{b:02X}" for b in fast[0].encode())
+        check(any(hexed in line.upper() for line in lay.lines), f"--show hex prints the hex: {hexed}\n{lay.text[-800:]}")
+    rec = ctx.record("vmic")
+    ctx.ok("say", "--volume", "0.9", "loud")
+    loud = rec.stop()
+    rec = ctx.record("vmic")
+    ctx.ok("say", "--volume", "0.1", "quiet")
+    quiet = rec.stop()
+    check(texts(loud) == ["loud"] and texts(quiet) == ["quiet"], "both decode")
+    check(np.abs(loud).max() > 4 * np.abs(quiet).max(), "say --volume")
+
+
+@case(AUDIO)
+def model_and_device_options(ctx):
+    with ctx.layer("--model", "tiny.en", "--device", "cpu") as lay:
+        check("tiny.en" in lay.status()["engine_name"] and "CPU" in lay.status()["engine_name"], lay.status())
+        audio = say_and_record(ctx, lay, "hello")
+        check(similar(" ".join(texts(audio)), PHRASES["hello"], 0.6), f"tiny.en: {texts(audio)}")
+
+
+@case(AUDIO)
 def controls_of_a_running_layer(ctx):
     with ctx.layer("-k", KEY, "--privacy", "plain") as lay:
         ctx.fails("listen", *ctx.rig.layer_args(), want="already running")
@@ -633,8 +663,16 @@ def start_off_and_passthrough(ctx):
 def hear_incoming_binharic(ctx):
     with ctx.layer("--start-off", *ctx.rig.hear_args()) as lay:
         lay.wait_for("decoding incoming binharic", 10)
+        ctx.record(ctx.rig.hear_from)  # what --hear receives, saved if this fails
         ctx.rig.play(modem.encode_text("message from a friend", sr=SR), ctx.rig.hear_from)
         lay.wait_for("▼ message from a friend|<< message from a friend", 20)
+    # a friend with their own key: --hear-key reads it, and hides their decoys
+    with ctx.layer("--start-off", "-k", KEY, "--hear-key", "friends key", *ctx.rig.hear_args()) as lay:
+        lay.wait_for("decoding incoming binharic", 10)
+        ctx.rig.play(modem.encode_text("their secret", key="friends key", sr=SR, decoys=2), ctx.rig.hear_from)
+        lay.wait_for("▼ their secret|<< their secret", 30)
+        time.sleep(2)
+        check("[encrypted" not in lay.text, f"decoys stay hidden:\n{lay.text[-1000:]}")
 
 
 @case(AUDIO)
@@ -662,6 +700,7 @@ def test_mode_round_trip_and_over_the_air(ctx):
     try:
         lay = ctx.layer("--air", cmd="test")
         with lay:
+            ctx.record("mic")  # what the mic heard (the speech, then the screech over the air)
             rec = ctx.record("vmic")
             ctx.rig.play(speech("hello"))
             lay.wait_for("round trip OK|OK round trip", 60)
@@ -694,11 +733,18 @@ def accurate_whisper(ctx):
 @case({"linux"})
 def survives_a_sound_server_restart(ctx):
     with ctx.layer() as lay:
+        mark = lay.mark()
         ctx.rig.restart_server()
-        lay.wait_for("reconnected|re-created", 60)
-        time.sleep(2)
+        # both the mic and the output reconnect, and the Binharic Mic comes back
+        end = time.monotonic() + 60
+        while sum("audio reconnected" in line for line in lay.lines[mark:]) < 2 and time.monotonic() < end:
+            time.sleep(0.2)
+        lay.wait_for("re-created the Binharic Mic", 5, since=mark)
+        check(sum("audio reconnected" in line for line in lay.lines[mark:]) >= 2,
+              f"mic and output should both reconnect:\n{lay.text[-2000:]}")
+        time.sleep(1)
         audio = say_and_record(ctx, lay, "hello")
-        check(similar(" ".join(texts(audio)), PHRASES["hello"]), f"after the restart: {texts(audio)}")
+        check(similar(" ".join(texts(audio)), PHRASES["hello"]), f"after the restart: {texts(audio)}:\n{lay.text[-2000:]}")
 
 
 @case({"linux"})

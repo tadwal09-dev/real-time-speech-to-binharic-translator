@@ -70,7 +70,18 @@ It installs uv and a private Python, plus Whisper, a `binharic` command and a St
 shortcut, then runs `binharic fix`. For Discord, install the free
 **[VB-Audio Virtual Cable](https://vb-audio.com/Cable/)** (as administrator, then reboot).
 binharic plays into "CABLE Input"; pick **"CABLE Output"** as your mic in Discord. Everything
-else (GUI, TUI, `test`, hotkey commands) works the same as on Linux.
+else (GUI, TUI, `test`, hotkey commands) works the same as on Linux. Plain `binharic` (or
+the Start-menu shortcut) opens the window, and `binharic mic` tells you whether the cable
+is installed.
+
+Windows differences:
+
+* `--hear` and `decode --input-device` take an input device (see `binharic devices`):
+  the device the screech arrives on. `--hear speakers` needs "Stereo Mix", turned on
+  in Sound settings → Recording.
+* Recording needs microphone access for desktop apps: Settings → Privacy & security →
+  Microphone. `binharic fix` checks it.
+* Ctrl+C or Ctrl+Break in the terminal, or closing binharic's window, stops it cleanly.
 
 ## iPhone / iPad (iSH)
 
@@ -309,6 +320,14 @@ binharic download-model medium.en         # fetch another Whisper model
 ## Development
 
 ```sh
-python -m venv .venv && .venv/bin/pip install -e '.[all,test]'
-.venv/bin/pytest
+python -m venv .venv && .venv/bin/pip install -e '.[all,test]' pyte
+.venv/bin/pytest -q tests                    # unit tests: no sound devices needed
+.venv/bin/python -m tests.e2e.run            # every command, end to end, on your real sound system
+.venv/bin/python -m tests.e2e.run -k listen --repeat 3
 ```
+
+The end-to-end suite adds a fake mic and fake speakers to PipeWire/PulseAudio (or uses
+VB-Audio's cables on Windows), talks into the mic with recorded speech, and decodes what
+comes out of the virtual mic. CI runs it on every push: Windows (via `install.ps1`), Arch
+Linux with PipeWire (via `install.sh`), Ubuntu with PulseAudio, and 32-bit Alpine for iSH.
+`ARCHITECTURE.md` explains how the code fits together.
