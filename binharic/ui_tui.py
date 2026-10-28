@@ -13,7 +13,7 @@ from .core import Translator
 from .stt import LIVE
 
 KEYS = [("space", "on/off"), ("l", "finish ⇄ live"), ("x", "test"), ("m", "mode"), ("k", "key"),
-        ("c", "decoys"), ("t", "type"), ("p", "pass"), ("+/-", "speed"), ("q", "quit")]
+        ("c", "privacy"), ("t", "type"), ("p", "pass"), ("+/-", "speed"), ("q", "quit")]
 
 
 class Dashboard:
@@ -78,7 +78,8 @@ class Dashboard:
         send = "AS I TALK" if s.send_mode == LIVE else "AFTER I FINISH"
         x = 1
         for label, val, hi in [("send", send, True), ("mode", s.mode, False), ("speed", f"{s.speed:.1f}x", False),
-                               ("key", ("set" + (f" +{s.decoys} decoys" if s.decoys else "")) if s.key else "none", bool(s.key)),
+                               ("privacy", {"plain": "UNENCRYPTED", "encrypted": "encrypted",
+                                            "decoys": f"encrypted+{s.decoys} decoys"}[s.privacy], s.privacy != "plain"),
                                ("out", s.sink or self.tr.speakers_label, False),
                                ("passthrough", "on" if s.passthrough else "off", False)]:
             put(2, x, f"{label}: ", curses.A_DIM)
@@ -163,12 +164,15 @@ class Dashboard:
             tr.set_speed(tr.s.speed + 0.25)
         elif ch == ord("-"):
             tr.set_speed(tr.s.speed - 0.25)
-        elif ch == ord("c"):
-            tr.set_decoys(0 if tr.s.decoys else 3)
+        elif ch == ord("c"):  # unencrypted -> encrypted -> encrypted + gibberish -> ...
+            order = ["plain", "encrypted", "decoys"]
+            tr.set_privacy(order[(order.index(tr.s.privacy) + 1) % 3])
         elif ch == ord("k"):
             key = self.prompt(scr, "key (empty clears): ", secret=True)
             if key is not None:
                 tr.set_key(key)
+                if key and tr.s.privacy == "plain":
+                    tr.set_privacy("encrypted")
         elif ch == ord("t"):
             text = self.prompt(scr, "screech: ")
             if text:

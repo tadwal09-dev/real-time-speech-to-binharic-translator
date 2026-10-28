@@ -264,7 +264,7 @@ def test_decoys_need_a_key():
 
 
 def test_layer_hides_decoys_from_key_holders(monkeypatch, tmp_path):
-    tr = core.Translator(core.Settings(control_socket=False, key="cog", decoys=2))
+    tr = core.Translator(core.Settings(control_socket=False, key="cog", privacy="decoys", decoys=2))
     played = []
 
     class Out:

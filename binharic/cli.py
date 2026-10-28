@@ -102,12 +102,21 @@ def _settings(args):
         send_mode=LIVE if args.live else PHRASE,
         mode=args.mode, key=_key(args.key), speed=args.speed, volume=args.volume,
         passthrough=args.passthrough, engine=args.engine, model=model, live_model=live_model,
-        device=args.device, beam=beam, decoys=args.decoys, partials=partials, language=args.language, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
+        device=args.device, beam=beam, privacy=_privacy(args), decoys=args.decoys or 3, partials=partials, language=args.language, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
         sink=sink, source=pulse.resolve_source(args.source) or (cfg.get("source") if not args.input_device else None),
         output_device=args.output_device, input_device=args.input_device or cfg.get("input_device"),
         duplex=args.duplex, end_ms=pause,
         hear=pulse.resolve_source(args.hear), hear_key=_key(args.hear_key) if args.hear_key else None,
     )
+
+
+def _privacy(args) -> str:
+    """--privacy, or what the other options imply: a key -> encrypted, --decoys -> decoys."""
+    key = _key(args.key)
+    privacy = args.privacy or ("decoys" if args.decoys else "encrypted" if key else "plain")
+    if privacy != "plain" and not key:
+        sys.exit(f"--privacy {privacy} needs a key: add -k \"your passphrase\" (or set BINHARIC_KEY)")
+    return privacy
 
 
 def _translator(args):
@@ -142,8 +151,14 @@ def _no_live_audio_on_ish():
 
 def cmd_ish(args):
     from . import ish
-    ish.run(mode=getattr(args, "mode", "binharic"), key=_key(getattr(args, "key", None)),
-            speed=getattr(args, "speed", 1.0))
+    key = _key(getattr(args, "key", None))
+    privacy = getattr(args, "privacy", None) or ("decoys" if getattr(args, "decoys", 0) else
+                                                  "encrypted" if key else "plain")
+    if privacy != "plain" and not key:
+        sys.exit(f"--privacy {privacy} needs a key: add -k \"your passphrase\"")
+    ish.run(mode=getattr(args, "mode", "binharic"), key=key if privacy != "plain" else None,
+            speed=getattr(args, "speed", 1.0),
+            decoys=(getattr(args, "decoys", 0) or 3) if privacy == "decoys" else 0)
 
 
 def cmd_fix(args):
@@ -224,7 +239,9 @@ def _control(cmd: str):
     st = json.loads(reply)
     on = "[bold green]ON[/]" if st["enabled"] else "[bold red]OFF[/]"
     send = "as you talk" if st["send_mode"] == "live" else "after you finish"
-    say_line(f"{on} · send {send} · mode {st['mode']} · key {'set' if st['key'] else 'none'}",
+    priv = {"plain": "[bold red]UNENCRYPTED[/]", "encrypted": "[green]encrypted[/]",
+            "decoys": "[green]encrypted + gibberish[/]"}.get(st.get("privacy"), "?")
+    say_line(f"{on} · send {send} · mode {st['mode']} · {priv}",
              f"{'ON' if st['enabled'] else 'OFF'} · send {send} · mode {st['mode']}")
 
 
@@ -243,7 +260,9 @@ def cmd_say(args):
         sys.exit("nothing to say: binharic say \"your message\"  (or pipe text in)")
     if ISH and not args.wav:
         from . import ish
-        path = ish.to_wav(text, args.mode, _key(args.key), args.speed)
+        privacy = _privacy(args)
+        path = ish.to_wav(text, args.mode, _key(args.key) if privacy != "plain" else None, args.speed,
+                          decoys=(args.decoys or 3) if privacy == "decoys" else 0)
         say_line(f"[green]wrote[/] {esc(path)} [dim](play it from the Files app: iSH -> root -> binharic)[/]")
         return
     if not args.wav and not args.direct:
@@ -258,10 +277,11 @@ def cmd_say(args):
             say_line("[green]⚙ queued in the running binharic[/] [dim](its mode, key and speed apply; "
                      "--direct plays it yourself)[/]")
             return
-    if args.decoys and not _key(args.key):
-        sys.exit("--decoys needs a key (-k): without one, anyone can read the real message anyway")
-    audio = modem.encode_text(text, args.mode, key=_key(args.key), sr=SR, speed=args.speed, volume=args.volume,
-                              decoys=args.decoys)
+    privacy = _privacy(args)
+    key = _key(args.key) if privacy != "plain" else None
+    decoys = (args.decoys or 3) if privacy == "decoys" else 0
+    audio = modem.encode_text(text, args.mode, key=key, sr=SR, speed=args.speed, volume=args.volume,
+                              decoys=decoys)
     if args.wav:
         from .audio import write_wav
         write_wav(args.wav, audio, SR)
@@ -487,8 +507,12 @@ def _run_options(p, inherit: bool = False):
     g.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic",
                    help="binharic = Mechanicus screech, hex = 16 tones, binary = 0/1 beeps")
     g.add_argument("-k", "--key", help="shared cant-key; only holders can read you (or set BINHARIC_KEY)")
+    g.add_argument("--privacy", choices=["plain", "encrypted", "decoys"],
+                   help="plain = unencrypted, encrypted = only key holders can read it, decoys = encrypted and "
+                        "hidden among gibberish chirps (default: encrypted if you give -k, else plain)")
     g.add_argument("--decoys", type=_ranged(int, 0, 8, "decoys"), default=0,
-                   help="hide each encrypted message among N gibberish chirps (0-8, needs -k)")
+                   help="how many gibberish chirps per message in decoys privacy (1-8, default 3; implies "
+                        "--privacy decoys)")
     g.add_argument("--speed", type=SPEED, default=1.0, help="tempo multiplier 0.25-4, listeners must match")
     g.add_argument("--volume", type=VOLUME, default=0.6, help="0.01-1")
 
@@ -554,6 +578,10 @@ def build_parser() -> argparse.ArgumentParser:
                             ("on", "on", "turn it ON"), ("off", "off", "turn it OFF"),
                             ("status", "status", "show the running layer's state")]:
         sub.add_parser(name, help=text).set_defaults(func=cmd_ctl, command=cmd)
+    s = sub.add_parser("privacy", help="running layer: plain (unencrypted), encrypted, or decoys "
+                                       "(encrypted + gibberish)")
+    s.add_argument("level", choices=["plain", "encrypted", "decoys"])
+    s.set_defaults(func=lambda a: _control(f"privacy {a.level}"))
     s = sub.add_parser("send", help="choose when to screech: toggle, live (as I talk), phrase (after I finish)")
     s.add_argument("when", nargs="?", choices=["toggle", "live", "phrase"], default="toggle")
     s.set_defaults(func=lambda a: _control(f"send {a.when}"))
@@ -566,8 +594,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--speed", type=SPEED, default=1.0)
     s.add_argument("--volume", type=VOLUME, default=0.6)
     s.add_argument("--wav", help="write to this WAV file instead of playing")
+    s.add_argument("--privacy", choices=["plain", "encrypted", "decoys"],
+                   help="plain, encrypted, or encrypted + gibberish chirps (default: encrypted if -k, else plain)")
     s.add_argument("--decoys", type=_ranged(int, 0, 8, "decoys"), default=0,
-                   help="hide the message among N gibberish chirps (needs -k)")
+                   help="gibberish chirps per message (implies --privacy decoys; default 3)")
     s.add_argument("--direct", action="store_true", help="play it yourself even if a layer is running")
     s.add_argument("--sink", default="auto", help="auto (Binharic Mic if set up), default (your speakers) or a name")
     s.add_argument("--output-device")
@@ -601,6 +631,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("ish", help="iSH on iOS: dictate or type, get sound files")
     s.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic")
     s.add_argument("-k", "--key")
+    s.add_argument("--privacy", choices=["plain", "encrypted", "decoys"])
+    s.add_argument("--decoys", type=_ranged(int, 0, 8, "decoys"), default=0)
     s.add_argument("--speed", type=SPEED, default=1.0)
     s.set_defaults(func=cmd_ish)
 

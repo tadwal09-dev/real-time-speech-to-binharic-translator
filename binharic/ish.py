@@ -30,9 +30,10 @@ def outbox() -> Path:
     return d
 
 
-def to_wav(text: str, mode: str = "binharic", key: str | None = None, speed: float = 1.0) -> Path:
+def to_wav(text: str, mode: str = "binharic", key: str | None = None, speed: float = 1.0,
+           decoys: int = 0) -> Path:
     from .audio import write_wav
-    audio = modem.encode_text(text, mode, key=key, sr=SR, speed=speed, volume=0.8)
+    audio = modem.encode_text(text, mode, key=key, sr=SR, speed=speed, volume=0.8, decoys=decoys)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     path = outbox() / f"{stamp}.wav"
     n = 1
@@ -58,10 +59,13 @@ def readable(path: str) -> str:
     return str(out)
 
 
-def run(mode: str = "binharic", key: str | None = None, speed: float = 1.0, show: str = "hex") -> None:
+def run(mode: str = "binharic", key: str | None = None, speed: float = 1.0, show: str = "hex",
+        decoys: int = 0) -> None:
     print("binharic for iSH. Type, or tap the keyboard's mic key and talk; Enter sends.\n"
           f"Each line becomes a sound file in {outbox()} (Files app -> iSH -> root -> binharic;\n"
-          "latest.wav is always the newest). Empty line or Ctrl+D quits.\n")
+          "latest.wav is always the newest). Empty line or Ctrl+D quits.\n"
+          + ("Privacy: encrypted + gibberish chirps.\n" if decoys else "Privacy: encrypted.\n" if key
+             else "Privacy: UNENCRYPTED (add -k \"passphrase\" to encrypt).\n"))
     while True:
         try:
             line = input("> ").strip()
@@ -71,6 +75,6 @@ def run(mode: str = "binharic", key: str | None = None, speed: float = 1.0, show
         if not line:
             return
         t = time.monotonic()
-        path = to_wav(line, mode, key, speed)
+        path = to_wav(line, mode, key, speed, decoys)
         shown = codec.to_binary(line) if show == "binary" else codec.to_hex(line)
         print(f"  {shown}\n  -> {path.name} ({time.monotonic() - t:.1f}s)", file=sys.stdout)

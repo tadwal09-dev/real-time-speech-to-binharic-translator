@@ -75,23 +75,41 @@ def run(tr: Translator) -> None:
     segmented(panel, mode_var, [("binharic", "Binharic screech"), ("hex", "Hex tones"), ("binary", "Binary 0/1")],
               lambda: tr.set_mode(mode_var.get())).grid(row=1, column=1, sticky="w")
 
-    label(panel, "Key", bg=PANEL).grid(row=2, column=0, sticky="w", pady=4)
+    label(panel, "Privacy", bg=PANEL).grid(row=2, column=0, sticky="w", pady=4)
+    priv_var = tk.StringVar(value=tr.s.privacy)
+
+    def choose_privacy():
+        wanted = priv_var.get()
+        typed = key_var.get()
+        if wanted != "plain" and typed and typed != (tr.s.key or ""):
+            tr.set_key(typed)  # a key typed but not "Set" yet: use it
+        tr.set_privacy(wanted)  # refuses without a key; refresh() then shows what's really active
+        refresh()
+
+    segmented(panel, priv_var, [("plain", "Unencrypted"), ("encrypted", "Encrypted"),
+                                ("decoys", "Encrypted + gibberish")], choose_privacy).grid(row=2, column=1, sticky="w")
+
+    label(panel, "Key", bg=PANEL).grid(row=3, column=0, sticky="w", pady=4)
     keyrow = tk.Frame(panel, bg=PANEL)
-    keyrow.grid(row=2, column=1, sticky="we")
+    keyrow.grid(row=3, column=1, sticky="we")
     key_var = tk.StringVar(value=tr.s.key or "")
     key_entry = tk.Entry(keyrow, textvariable=key_var, show="•", bg=BG, fg=FG, insertbackground=FG,
                          relief="flat", font=mono, width=24, highlightthickness=1,
                          highlightbackground=PANEL, highlightcolor=RED)
     key_entry.pack(side="left", ipady=3)
-    key_entry.bind("<Return>", lambda e: (tr.set_key(key_var.get()), root.focus()))
-    tk.Button(keyrow, text="Set", command=lambda: tr.set_key(key_var.get()), bg=RED, fg="white", bd=0,
+
+    def set_key(*_):
+        tr.set_key(key_var.get())
+        if key_var.get() and tr.s.privacy == "plain":
+            tr.set_privacy("encrypted")  # setting a key means you want to use it
+        refresh()
+        root.focus()
+
+    key_entry.bind("<Return>", set_key)
+    tk.Button(keyrow, text="Set", command=set_key, bg=RED, fg="white", bd=0,
               activebackground=RED_HI, font=ui, padx=10, cursor="hand2").pack(side="left", padx=6)
-    label(keyrow, "only key holders can read you", bg=PANEL).pack(side="left")
-    decoy_var = tk.BooleanVar(value=tr.s.decoys > 0)
-    tk.Checkbutton(panel, text="Hide it among decoy chirps (only key holders can tell which is real)",
-                   variable=decoy_var, command=lambda: tr.set_decoys(3 if decoy_var.get() else 0), bg=PANEL,
-                   fg=FG, selectcolor=BG, activebackground=PANEL, activeforeground=FG, font=ui,
-                   highlightthickness=0).grid(row=3, column=1, sticky="w")
+    priv_lbl = label(keyrow, "", bg=PANEL)
+    priv_lbl.pack(side="left")
 
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -220,7 +238,11 @@ def run(tr: Translator) -> None:
         mode_var.set(s.mode)
         pass_var.set(s.passthrough)
         test_var.set(s.test)
-        decoy_var.set(s.decoys > 0)
+        priv_var.set(s.privacy)
+        priv_lbl.configure(text={"plain": "anyone with the decoder can read you",
+                                 "encrypted": "only key holders can read you",
+                                 "decoys": f"+{s.decoys} decoys: only key holders can tell which is real"}[s.privacy],
+                           fg=AMBER if s.privacy == "plain" else DIM)
         engine_lbl.configure(text=tr.engine_name if tr.ready else "loading speech model…")
 
     def poll():
@@ -239,7 +261,9 @@ def run(tr: Translator) -> None:
                 if ev.get("test") and "latency_ms" in ev:
                     extra = (f"⏱ {ev['latency_ms']:.0f} ms after you stopped · recognition "
                              f"{ev['stt_ms']:.0f} ms · synth {ev['synth_ms']:.0f} ms")
-                add_log("sent", ev["text"], extra)
+                lock = {"plain": "unencrypted", "encrypted": "encrypted",
+                        "decoys": f"encrypted + {ev.get('decoys', 0)} decoys"}.get(ev.get("privacy", "plain"), "")
+                add_log("sent", f"{ev['text']}   [{lock}]", extra)
             elif kind == "verify":
                 via = "over the air" if ev["via"] == "air" else "round trip"
                 add_log("recv" if ev["ok"] else "error",

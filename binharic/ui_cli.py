@@ -107,8 +107,10 @@ class Printer:
                 self._partial = text
         elif kind == "sent":
             shown = {"hex": ev["hex"], "binary": ev["binary"]}.get(self.show, ev["text"])
-            self._out(f"[dim]{t}[/] [bold red]▲ {ev['mode']}[/] {_esc(shown)} [dim]({ev['seconds']:.1f}s)[/]",
-                      f"{t} >> {shown}")
+            priv = {"plain": "[yellow]unencrypted[/]", "encrypted": "[green]encrypted[/]",
+                    "decoys": f"[green]encrypted +{ev.get('decoys', 0)} decoys[/]"}.get(ev.get("privacy", "plain"), "")
+            self._out(f"[dim]{t}[/] [bold red]▲ {ev['mode']}[/] {_esc(shown)} [dim]({ev['seconds']:.1f}s ·[/] {priv}[dim])[/]",
+                      f"{t} >> {shown}  ({ev.get('privacy', 'plain')})")
             if ev.get("test") or self.test:
                 self._timing(ev)
         elif kind == "verify":
@@ -131,7 +133,7 @@ def describe(tr: Translator) -> str:
         "ON" if s.enabled else "OFF",
         "send: as you talk" if s.send_mode == LIVE else "send: after you finish",
         f"mode: {s.mode}",
-        "key: set" if s.key else "key: none",
+        {"plain": "UNENCRYPTED", "encrypted": "encrypted", "decoys": f"encrypted + {s.decoys} decoys"}[s.privacy],
         f"out: {s.sink or 'default output'}",
     ]
     if s.passthrough:

@@ -59,7 +59,8 @@ class Settings:
     end_ms: int = 700           # silence that ends a phrase
     hear: str | None = None     # source to decode incoming binharic from
     hear_key: str | None = None
-    decoys: int = 0             # gibberish frames hiding each encrypted message (needs a key)
+    privacy: str = "plain"      # plain | encrypted | decoys (encrypted + gibberish chirps)
+    decoys: int = 3             # how many gibberish frames hide each message in "decoys" privacy
     beam: int = 5               # whisper beam size for the final pass (1 = fastest)
     language: str | None = None # whisper language for multilingual models (None = detect)
     partials: bool = True       # show what you're saying while you say it (phrase mode)
@@ -114,6 +115,12 @@ def send_command(cmd: str, timeout: float = 3.0) -> str:
         s.sendall(cmd.encode() + b"\n")
         return s.makefile().readline().strip()
 
+
+PRIVACY = {
+    "plain": "sending UNENCRYPTED: anyone with the decoder can read you",
+    "encrypted": "sending ENCRYPTED: only people with your key can read you",
+    "decoys": "sending ENCRYPTED + gibberish: only key holders can read you or tell which chirp is real",
+}
 
 Event = dict
 Listener = Callable[[str, Event], None]
@@ -228,19 +235,44 @@ class Translator:
         self.log(f"screech mode: {mode}")
         self._changed()
 
+    @property
+    def send_key(self) -> str | None:
+        """The key messages are sent with: none in plain privacy, even if one is set."""
+        return self.s.key if self.s.privacy != "plain" else None
+
+    @property
+    def send_decoys(self) -> int:
+        return self.s.decoys if self.s.privacy == "decoys" and self.s.key else 0
+
+    def set_privacy(self, privacy: str) -> bool:
+        """plain / encrypted / decoys. Refuses to encrypt without a key (and says so)."""
+        if privacy not in PRIVACY:
+            raise ValueError(f"privacy is one of: {', '.join(PRIVACY)}")
+        if privacy != "plain" and not self.s.key:
+            self.log("set a key first: encryption needs one (until then messages stay unencrypted)", "error")
+            self._changed()
+            return False
+        self.s.privacy = privacy
+        self.log(PRIVACY[privacy] + (f" ({self.s.decoys} decoys per message)" if privacy == "decoys" else ""))
+        self._changed()
+        return True
+
     def set_key(self, key: str | None) -> None:
         self.s.key = key or None
+        if not self.s.key and self.s.privacy != "plain":
+            self.s.privacy = "plain"
+            self.log("key cleared: now sending UNENCRYPTED - anyone with the decoder can read you", "warn")
+            self._changed()
+            return
         self.log("key set" if key else "key cleared: anyone with the decoder can read you")
         self._changed()
 
     def set_decoys(self, n: int) -> None:
-        self.s.decoys = max(0, min(modem.MAX_DECOYS, int(n)))
-        if self.s.decoys and not self.s.key:
-            self.log("decoys need a key: set one, or they're not sent (without a key anyone can read you anyway)",
-                     "warn")
-        else:
-            self.log(f"hiding each message among {self.s.decoys} decoy chirps" if self.s.decoys else "decoys off")
-        self._changed()
+        """How many decoys; 0 means plain encryption, more than 0 switches to decoys."""
+        n = max(0, min(modem.MAX_DECOYS, int(n)))
+        if n:
+            self.s.decoys = n
+        self.set_privacy("decoys" if n else "encrypted")
 
     def set_test(self, on: bool, air: bool | None = None) -> None:
         self.s.test = on
@@ -527,7 +559,10 @@ class Translator:
     def _queue_text(self, text: str, final: bool, force: bool = False, meta: dict | None = None):
         if not text or (not (self.s.enabled or self.s.test) and not force):
             return
-        meta = dict(meta or {}, forced=force)
+        # privacy is fixed the moment you speak/type: switching it while this
+        # waits in the queue must never change how it's sent
+        meta = dict(meta or {}, forced=force, privacy=self.s.privacy if self.send_key else "plain",
+                    key=self.send_key, decoys=self.send_decoys)
         with self._pending_lock:
             self._pending.append((text, meta))
             self._abort.clear()  # a new message after an OFF: let it play
@@ -537,13 +572,18 @@ class Translator:
         with self._pending_lock:
             if not self._pending:
                 return None
-            text = " ".join(t for t, _ in self._pending)
+            # join waiting messages, but only ones sent with the same privacy
+            first = self._pending[0][1]
+            same = lambda m: (m.get("key"), m.get("decoys")) == (first.get("key"), first.get("decoys"))  # noqa: E731
+            batch = []
+            while self._pending and same(self._pending[0][1]):
+                batch.append(self._pending.pop(0))
+            text = " ".join(t for t, _ in batch)
             meta = {}
-            for _, m in self._pending:
+            for _, m in batch:
                 forced = meta.get("forced", False) or m.get("forced", False)
                 meta.update(m)
                 meta["forced"] = forced
-            self._pending.clear()
         return text, meta
 
     def _target(self) -> Output:
@@ -604,7 +644,8 @@ class Translator:
                 # corrupts the screech, so this is worth the ~50 ms
                 t = time.monotonic()
                 spec = modem.get_mode(s.mode, s.speed)
-                frames = modem.frames_with_decoys(chunk, spec.id, s.key, s.decoys)
+                key = meta.get("key")  # as chosen when this was said, not now
+                frames = modem.frames_with_decoys(chunk, spec.id, key, meta.get("decoys", 0) if key else 0)
                 bodies = [(real, modem.modulate_body(f, spec, SR, s.volume)) for real, f in frames]
                 body = next(b for real, b in bodies if real)
                 synth_ms = (time.monotonic() - t) * 1000
@@ -612,13 +653,13 @@ class Translator:
                 audio = np.concatenate([x for _, b in bodies for x in (lead, b)])
                 info = dict(text=chunk, hex=codec.to_hex(chunk), binary=codec.to_binary(chunk),
                             seconds=len(audio) / SR, mode=s.mode, synth_ms=synth_ms,
-                            test=s.test, decoys=len(bodies) - 1)
+                            test=s.test, decoys=len(bodies) - 1, privacy=meta.get("privacy", "plain") if key else "plain")
                 if n == 0 and "stopped_at" in meta:
                     info.update(latency_ms=(first_sound - meta["stopped_at"]) * 1000,
                                 stt_ms=meta["stt_ms"], speculative=meta["speculative"])
                 self.emit("sent", **info)
                 if s.test:
-                    self._verify(chunk, np.concatenate([lead, body]), s.mode, s.key, s.speed)
+                    self._verify(chunk, np.concatenate([lead, body]), s.mode, key, s.speed)
                 step = BLOCK * 5  # 100 ms writes: fewer wake-ups for a busy CPU to miss
                 for i in range(0, len(audio), step):
                     if self._abort.is_set() or self._stop.is_set():
@@ -734,6 +775,9 @@ class Translator:
             self.set_mode(arg)
         elif cmd == "passthrough":
             self.set_passthrough(arg != "off" if arg else not self.s.passthrough)
+        elif cmd == "privacy":
+            if not self.set_privacy(arg):
+                return "error: set a key first (encryption needs one)"
         elif cmd == "decoys":
             self.set_decoys(int(arg or 0))
         elif cmd == "test":

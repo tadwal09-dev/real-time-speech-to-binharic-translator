@@ -42,6 +42,7 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 
   The installers now run `fix` at the end. `doctor` stays as a read-only check and points
   to `fix`.
+- **Privacy options** (latest): `plain` / `encrypted` / `decoys` via `--privacy`, GUI Privacy row, TUI `c`, `binharic privacy X`. `Settings.privacy`; `Translator.send_key`/`send_decoys`. Privacy is captured at queue time in the item meta (`_queue_text`), and `_take_pending` only merges items with the same key and decoy count (regression test in `tests/test_privacy.py`). Cipher rewritten in `codec.py`: scrypt KDF (cached), HMAC-SHA256 keystream, 6-byte nonce plus 6-byte encrypt-then-MAC tag; this breaks old encrypted frames. Verified on real PulseAudio: an eavesdropper reads only the plain message, a wrong key the same, the right key all three.
 - **Decoy chirps** (`--decoys N`, GUI checkbox under Key, TUI `c`, control `decoys N`): `codec.build_decoy` + `modem.frames_with_decoys` hide each encrypted frame among look-alike gibberish frames; receivers holding a key drop frames that fail the key check.
 - **Ctrl+C bug fixed:** the pacat/parec children now run with `start_new_session=True`.
 - **Faster by default:** without a usable GPU, `listen`, `test`, `gui` and `tui` use the
@@ -92,7 +93,7 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 | `binharic/stt.py` | Whisper engine (`small.en` final pass plus `base.en` live, speculative final pass, warm-up, GPU-to-CPU fallback, hallucination filter) and Vosk engine. `Transcriber` does the phrase/live logic (agreement, holding back the last word, `remaining_words` alignment) |
 | `binharic/vad.py` | Energy VAD with minimum-statistics noise floor, pause/resume events, `since_voice`; `Decimator` (48 kHz to 16 kHz) |
 | `binharic/modem.py` | Chirp sync plus FSK. Modes: binary (2 tones), hex and binharic (16 tones; binharic adds warble, buzz and glides). Exact timing grid, an early/late gate that tracks clock drift, and `StreamDecoder` that handles candidates without blocking |
-| `binharic/codec.py` | Frame format (magic/mode/flags, nonce plus key check, length, CRC-16), SHA-256 keystream, `split_text` (240-byte chunks) |
+| `binharic/codec.py` | Frame format (magic/mode/flags, nonce, MAC tag, length, CRC-16), scrypt plus HMAC cipher, decoys, `split_text` (240-byte chunks) |
 | `binharic/audio.py` | pacat/parec streams (errors at start, reconnect, `ensure_alive`), with PortAudio as the fallback; WAV input/output |
 | `binharic/pulse.py` | `pactl` helpers: create/remove the virtual mic (and restore the defaults), `real_source`/`real_sink` (never our own virtual devices), `check_device`, `probe_source` |
 | `binharic/fix.py` | `binharic fix`: the real repair tool (see status above), including resumable wheel downloads |
@@ -100,7 +101,7 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 | `binharic/gpu.py` | Loads the CUDA 12 libraries from the pip wheels without `LD_LIBRARY_PATH` |
 | `binharic/ui_cli.py`, `ui_tui.py`, `ui_gui.py` | The log, curses and Tk front ends |
 | `install.sh`, `contrib/` | Installer (pacman, uv, models, mic, doctor, `--uninstall`), user systemd unit, desktop entry |
-| `tests/` | 87 tests; `test_platforms.py` covers Windows/iSH/fix with fakes. `test_fixes.py` holds the regressions from the full test pass |
+| `tests/` | 117 tests; `test_privacy.py` covers the cipher and the three options; `test_platforms.py` covers Windows/iSH/fix with fakes. `test_fixes.py` holds the regressions from the full test pass |
 
 ## How it was tested (rebuild this; the scripts were in a session scratch folder)
 
@@ -138,7 +139,7 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 - CPU latency, measured in the container (4 cores): `--fast` about 1.4 s from the end of
   speech to the first screech, default about 4 s. A GPU should be much faster but is
   unmeasured.
-- The key is a SHA-256 keystream with a nonce. It's obfuscation, not audited cryptography.
+- Encryption: scrypt plus HMAC-SHA256, with a 48-bit nonce and tag (shortened for airtime). Sound, but not audited.
 
 ## Conventions
 

@@ -95,7 +95,7 @@ binharic
 | Command | What you get |
 |---|---|
 | `binharic gui` | A desktop window with a big ON/OFF button, send-mode and sound switches, key field, speed and pause sliders, a mic meter, a live transcript, history, and a "type to screech" box |
-| `binharic tui` | The same as a full-screen terminal dashboard. Keys: `space` on/off · `l` after-finish ⇄ live · `x` test mode · `m` mode · `k` key · `t` type · `p` passthrough · `+/-` speed · `q` quit |
+| `binharic tui` | The same as a full-screen terminal dashboard. Keys: `space` on/off · `l` after-finish ⇄ live · `x` test mode · `m` mode · `k` key · `c` privacy · `t` type · `p` passthrough · `+/-` speed · `q` quit |
 | `binharic listen` | A plain, colour-coded log. Good for a background service or a tmux pane |
 | `binharic` | Picks for you: the GUI on a desktop, the TUI in a terminal |
 
@@ -234,29 +234,42 @@ computers' sound cards (it decodes fine with the sender's clock 0.3% fast or slo
 30 times more than real sound cards differ). `--speed` changes the tempo (0.25–4×), and
 listeners must use the same speed.
 
-## Keys ("speaking in cant")
+## Privacy: unencrypted, encrypted, or encrypted + gibberish
 
-With `-k KEY` (or `BINHARIC_KEY`, or the GUI key field), the text is scrambled before it
-becomes sound. Someone decoding without the key gets `[encrypted, N bytes …]`. Someone
-with it gets the words. Without a key, anyone running the decoder can read it.
+There are three ways to send. Pick one with `--privacy`, the GUI's **Privacy** row, `c` in
+the TUI, or `binharic privacy …` while it runs:
 
-### Decoy chirps
-
-`--decoys N` (or *Hide it among decoy chirps* next to the GUI's key field, or `c` in the
-TUI) sends each encrypted message hidden among N gibberish frames. They chirp exactly like
-real encrypted messages and have random lengths, and the real one sits at a random place
-among them. Without the key, all of them look the same (`[encrypted …]`), so a listener
-can't tell which one is real or how long it is. With the key, the decoys fail the key
-check and are dropped silently; `binharic decode` says how many it skipped. It needs a
-key (`-k`), and each decoy adds roughly a message's length of screech.
+| Option | Who can read you | Cost |
+|---|---|---|
+| `plain` (**Unencrypted**) | anyone running `binharic decode` | none |
+| `encrypted` | only people with your key; anyone else gets `[encrypted, N bytes …]` | +12 bytes per message (about 0.6 s of screech in binharic mode) |
+| `decoys` (**Encrypted + gibberish**) | only key holders, and nobody else can tell which chirp is real or how long it is | each decoy adds about a message's length of screech |
 
 ```sh
-binharic listen -k "my cant key" --decoys 3
-binharic say -k "my cant key" --decoys 3 "meet at the forge"
+binharic listen -k "my cant key"                          # encrypted (a key implies it)
+binharic listen -k "my cant key" --privacy decoys --decoys 3
+binharic listen -k "my cant key" --privacy plain          # key kept, but sent in the open
+binharic privacy plain|encrypted|decoys                   # switch while running
+binharic say -k "my cant key" --privacy decoys "meet at the forge"
 ```
 
-> The key scrambling is a SHA-256 keystream. It keeps casual listeners out. It is not
-> audited cryptography.
+* Encrypted options need a key (`-k`, `BINHARIC_KEY`, or the GUI key field). Without one
+  they refuse rather than silently sending in the open.
+* The option is fixed the moment you speak: switching to `plain` never sends something
+  you said earlier, still in the queue, unencrypted.
+* Decoys look exactly like real encrypted frames (random lengths, random place among
+  them). A key holder's decoder drops them silently; `binharic decode` says how many it
+  skipped.
+
+**How the encryption works.** Your passphrase is stretched with scrypt (N=2^14, r=8, p=1:
+about 0.1 s, done once and cached), which makes guessing passphrases expensive. Each
+message gets a fresh random 48-bit nonce, is encrypted with an HMAC-SHA256 keystream, and
+is authenticated with an HMAC-SHA256 tag (encrypt-then-MAC, 48-bit tag, checked in
+constant time). Changing any bit of a frame, or using the wrong key, makes it read as
+`[encrypted …]` instead of decoding to garbage. It uses only Python's standard library.
+Limits: the tag and nonce are shortened to keep the screech short, and a weak passphrase
+can still be guessed, so use a long one. Messages from older versions' encryption can't be
+read by this version (unencrypted ones still can).
 
 ## The other side: understanding it
 
