@@ -4,6 +4,17 @@
 # Runners ship with the Windows Audio service off and no sound devices at all.
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+# Settings -> Privacy & security -> Microphone: allow apps (and desktop apps) to record.
+# It's off on runners, and recording then fails with "Unanticipated host error".
+foreach ($root in "HKLM:", "HKCU:") {
+  $k = "$root\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+  New-Item -Force -Path "$k\NonPackaged" | Out-Null
+  Set-ItemProperty -Path $k -Name Value -Value Allow
+  Set-ItemProperty -Path "$k\NonPackaged" -Name Value -Value Allow
+}
+New-Item -Force -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" | Out-Null
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name LetAppsAccessMicrophone -Value 1 -Type DWord
+
 Set-Service -Name AudioEndpointBuilder -StartupType Automatic
 Set-Service -Name Audiosrv -StartupType Automatic
 Start-Service AudioEndpointBuilder, Audiosrv
