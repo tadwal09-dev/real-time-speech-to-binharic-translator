@@ -151,6 +151,29 @@ def move_stream(index: int, device: str, playback: bool) -> None:
     _pactl("move-sink-input" if playback else "move-source-output", str(index), device)
 
 
+def misrouted_mic_streams() -> list[tuple[int, str, str | None]]:
+    """Apps that picked the Binharic Mic (Discord...) but record from something else:
+    (stream index, app, the source they're on or None). PipeWire falls back to the
+    default mic when it can't link a stream to the one it asked for; it did while
+    Bluetooth earbuds were switching modes, and Discord then sent the real mic."""
+    try:
+        sources = json.loads(_pactl("-f", "json", "list", "sources"))
+        mic = next((s["index"] for s in sources if s.get("name") == MIC), None)
+        if mic is None:
+            return []
+        names = {s.get("index"): s.get("name") for s in sources}
+        out = []
+        for st in json.loads(_pactl("-f", "json", "list", "source-outputs")):
+            p = st.get("properties", {})
+            # PulseAudio has no target.object: there apps stay where they were put
+            if str(p.get("target.object")) in (MIC, str(mic)) and st.get("source") != mic:
+                app = " · ".join(dict.fromkeys(filter(None, (p.get("application.name"), p.get("media.name")))))
+                out.append((st["index"], app or "an app", names.get(st.get("source"))))
+        return out
+    except Exception:  # an old pactl without -f json, or the server is going away
+        return []
+
+
 def describe(name: str | None, kind: str) -> str:
     for d in _info(kind):
         if d["name"] == name:

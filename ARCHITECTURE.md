@@ -95,6 +95,7 @@ is written. While OFF, the output is silent, or your voice with
 | `out` | owns the output: plays queued screeches, passthrough voice, or silence (PortAudio needs a steady stream) | fatal |
 | `air` | test mode: decodes what the mic heard from the speakers | logged |
 | `hear` | `--hear`: decodes incoming binharic from another source or device | logged |
+| `guard` | PipeWire, screeching into the Binharic Mic: every 2 s, moves apps that picked the Binharic Mic but were linked elsewhere back onto it (`pulse.misrouted_mic_streams`) | logged |
 | `control` | the control socket (below) | logged |
 
 `stop()` is idempotent. It sets `_stop` and `_abort`, joins the threads
@@ -243,6 +244,13 @@ flags 1 (0xB0 | mode_id<<1 | encrypted) · [nonce 6 · tag 6] · length 2 · pay
   found by the process id) and moves it back if it's wrong. PipeWire's
   session manager, when it is starting at the same moment (a restart, a
   login), can link a stream to the default device instead of the one named.
+* Other apps' streams go astray too. An app that picked the Binharic Mic (its
+  `target.object`) can still be linked to your real mic: when a link fails to activate,
+  WirePlumber falls back to the default source and never retries. The `guard` thread and
+  `binharic fix` move such streams back with `pactl move-source-output`. If a move doesn't
+  stick (links someone made by hand), the guard gives up after 3 tries and says what to do.
+  PulseAudio has no `target.object`, so there it does nothing. (When the requested device
+  doesn't exist yet, WirePlumber relinks by itself as soon as it appears.)
 * `Input` on PortAudio uses `latency="high"`: with "low", Windows' MME dropped
   input whenever a read came late. It also counts overflows (samples lost when
   the computer is busy) and warns once a minute through `notify`.
@@ -282,7 +290,7 @@ flags 1 (0xB0 | mode_id<<1 | encrypted) · [nonce 6 · tag 6] · length 2 · pay
 
 | | Linux (Arch + PipeWire) | Windows | iSH (iOS) |
 |---|---|---|---|
-| Install | `install.sh`: pacman, a uv venv on Python 3.12 at `~/.local/share/binharic/venv`, linked into `~/.local/bin` | `install.ps1`: uv, a venv in `%LOCALAPPDATA%\binharic\venv`, `bin\binharic.cmd` on the PATH, a Start-menu shortcut | `install-ish.sh`: apk python and numpy, venv `--system-site-packages`, `pip --no-deps` |
+| Install | `install.sh`: pacman, a uv venv on Python 3.12 at `~/.local/share/binharic/venv`, linked into `/usr/local/bin` (on every PATH, keybinds included) and `~/.local/bin` | `install.ps1`: uv, a venv in `%LOCALAPPDATA%\binharic\venv`, `bin\binharic.cmd` on the PATH, a Start-menu shortcut | `install-ish.sh`: apk python and numpy, venv `--system-site-packages`, `pip --no-deps` |
 | Virtual mic | `binharic_out` → `binharic_mic` (pactl) | VB-Audio Virtual Cable (play into CABLE Input; Discord records CABLE Output) | none: WAV files |
 | Control | unix socket | TCP on localhost plus a port file | (same as Linux; rarely used) |
 | Stop | SIGTERM / SIGHUP / Ctrl+C | Ctrl+C, Ctrl+Break / closing the console (SIGBREAK) | Ctrl+D or an empty line |
@@ -416,5 +424,8 @@ Push to the working branch; CI runs everything on all four platforms.
 * After a PipeWire restart the reconnected screech was linked to the default
   speakers, not `binharic_out`: Discord got silence and the screech played out
   loud. Never assume a stream is where you asked; `_PulseStream._watch` checks.
+* Discord (in Firefox) had picked the Binharic Mic, but PipeWire linked it to the user's
+  Bluetooth earbuds: a link failed while they switched to headset mode. The friend got the
+  earbuds' mic and never the screech. The `guard` thread moves such streams back.
 * A test helper process that isn't cleaned up keeps running for hours:
   every `Layer` registers itself with `ctx`, which kills it.

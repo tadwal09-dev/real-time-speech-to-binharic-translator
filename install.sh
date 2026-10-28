@@ -15,6 +15,9 @@ DATA=~/.local/share/binharic
 VENV=$DATA/venv
 BIN_DIR=~/.local/bin
 BIN=$BIN_DIR/binharic
+# a normal command everywhere: ~/.local/bin is only on the PATH of shells that read
+# ~/.bashrc, not of Hyprland/Sway keybinds or app launchers
+GLOBAL=/usr/local/bin/binharic
 
 # big downloads (CUDA, models) can drop mid-way: retry a few times
 retry() { local i; for i in 1 2 3; do "$@" && return 0; echo "   retrying ($i/3)…"; sleep 3; done; return 1; }
@@ -25,6 +28,7 @@ fail() { printf '\n\033[1;31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 if [[ "${1:-}" == "--uninstall" ]]; then
   systemctl --user disable --now binharic 2>/dev/null || true
   "$BIN" mic down 2>/dev/null || true
+  if [[ "$(readlink "$GLOBAL" 2>/dev/null)" == "$VENV/bin/binharic" ]]; then sudo rm -f "$GLOBAL" || true; fi
   rm -rf "$VENV" "$BIN" ~/.config/systemd/user/binharic.service ~/.local/share/applications/binharic.desktop
   echo "removed (speech models are still in $DATA - delete that folder to free the space)"
   exit 0
@@ -55,6 +59,12 @@ else
 fi
 ln -sf "$VENV/bin/binharic" "$BIN"
 "$BIN" --help >/dev/null || fail "binharic was installed but doesn't start"
+if command -v sudo >/dev/null && sudo ln -sf "$VENV/bin/binharic" "$GLOBAL"; then
+  GLOBAL_OK=1
+else
+  GLOBAL_OK=
+  echo "!! couldn't link $GLOBAL: binharic works only where ~/.local/bin is on the PATH"
+fi
 
 step "desktop entry and background service"
 mkdir -p ~/.config/systemd/user ~/.local/share/applications
@@ -76,11 +86,10 @@ step "creating the Binharic Mic"
 step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
 if [[ -n "${BINHARIC_NO_GPU:-}" ]]; then "$BIN" fix --no-gpu || true; else "$BIN" fix || true; fi
 
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *) printf '\n\033[1;33m%s is not on your PATH.\033[0m Add it with:\n' "$BIN_DIR"
-     echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc" ;;
-esac
+if [[ -z $GLOBAL_OK && ":$PATH:" != *":$BIN_DIR:"* ]]; then
+  printf '\n\033[1;33m%s is not on your PATH.\033[0m Add it with:\n' "$BIN_DIR"
+  echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+fi
 
 cat <<'MSG'
 

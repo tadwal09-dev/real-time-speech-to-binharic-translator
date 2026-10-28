@@ -130,6 +130,27 @@ class Fixer:
 
         self.step("virtual mic end to end")
         self._loop_check()
+        self._misrouted_apps()
+
+    def _misrouted_apps(self):
+        """Discord picked the Binharic Mic, but PipeWire linked it to the real mic."""
+        from . import pulse
+        stray = pulse.misrouted_mic_streams()
+        for index, _, _ in stray:
+            try:
+                pulse.move_stream(index, pulse.MIC, playback=False)
+            except Exception:
+                pass  # gone meanwhile, or it didn't move: checked below
+        if not stray:
+            return
+        time.sleep(1.0)  # the session manager relinks it
+        still = {s[0] for s in pulse.misrouted_mic_streams()}
+        for index, app, where in stray:
+            if index in still:
+                self.bad(f"{app} picked the Binharic Mic but records from {where or 'nothing'}, and won't move back",
+                         f"in {app}, pick another microphone, then the Binharic Mic again")
+            else:
+                self.did(f"{app} picked the Binharic Mic but was recording from {where or 'nothing'} - moved it back")
 
     def _unhijack_defaults(self, before):
         from . import pulse

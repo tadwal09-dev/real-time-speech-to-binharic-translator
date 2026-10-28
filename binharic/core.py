@@ -5,6 +5,7 @@ Threads:
   stt      - VAD + speech recognition; queues text to send
   out      - owns the output: screech, voice passthrough, or silence
   hear     - optional: decodes binharic arriving on another source
+  guard    - puts apps that picked the Binharic Mic back on it (PipeWire)
   control  - unix socket so hotkeys can run `binharic toggle` etc.
 
 While ON your voice is muted on the output and only the screech is sent.
@@ -127,6 +128,8 @@ Listener = Callable[[str, Event], None]
 
 
 class Translator:
+    GUARD_SECONDS = 2.0  # how often the guard checks who records from the Binharic Mic
+
     def __init__(self, settings: Settings):
         self.s = settings
         self._listeners: list[Listener] = []
@@ -332,6 +335,8 @@ class Translator:
         self._spawn(self._stt_loop, "stt")
         if self.s.hear:
             self._spawn(self._hear_loop, "hear")
+        if on_pulse and self.s.sink == pulse.SINK:
+            self._spawn(self._guard_loop, "guard")
         self._changed()
 
     def stop(self) -> None:
@@ -746,6 +751,29 @@ class Translator:
                 name = modem.MODES_BY_ID.get(m.mode_id)
                 self.emit("received", text=m.display(), locked=m.locked,
                           mode=name.name if name else "?")
+
+    def _guard_loop(self):
+        """Discord etc. picked the Binharic Mic, but PipeWire linked them to your real
+        mic instead (a link failed while Bluetooth earbuds switched modes): your friend
+        got your voice, or the earbuds' silence, and never the screech. Put them back."""
+        tries: dict[int, int] = {}  # per stream, in the current incident
+        while not self._stop.wait(self.GUARD_SECONDS):
+            stray = pulse.misrouted_mic_streams()
+            tries = {i: n for i, n in tries.items() if i in {s[0] for s in stray}}  # back where it belongs
+            for index, app, where in stray:
+                n = tries[index] = tries.get(index, 0) + 1
+                where = pulse.describe(where, "sources") if where else "nothing"
+                if n > 3:  # a move doesn't stick (e.g. someone wired it by hand): say so once, then leave it
+                    if n == 4:
+                        self.log(f"{app} still records from {where}, not the Binharic Mic: in {app}, pick "
+                                 "another microphone, then the Binharic Mic again", "error")
+                    continue
+                try:
+                    pulse.move_stream(index, pulse.MIC, playback=False)
+                except Exception:
+                    continue  # gone meanwhile
+                if n == 1:
+                    self.log(f"{app} picked the Binharic Mic but was recording from {where}: moving it back", "warn")
 
     # -- control socket ---------------------------------------------------
     def _start_control(self):

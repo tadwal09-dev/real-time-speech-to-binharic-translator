@@ -26,7 +26,8 @@ cd real-time-speech-to-binharic-translator
 The installer does five things:
 - installs `portaudio libpulse tk libnotify uv` with pacman
 - builds a private Python 3.12 environment with uv in `~/.local/share/binharic/venv`,
-  so it doesn't matter which Python Arch ships, and links `binharic` into `~/.local/bin`
+  so it doesn't matter which Python Arch ships, and links `binharic` into `/usr/local/bin`:
+  a normal command that works from any folder, in hotkeys and in app launchers
 - downloads the offline Whisper models (`small.en` and `base.en`, about 600 MB)
 - creates the Binharic Mic
 - runs `binharic doctor` to check everything
@@ -162,6 +163,13 @@ can mangle or even delete a screech, so in Discord's *Voice & Video* settings tu
 
 Mumble, TeamSpeak and OBS have similar noise-suppression options. If your friends'
 `binharic decode` misses messages, that's the first thing to check.
+
+Discord lists **Binharic_Output** as a speaker: that's the virtual speaker binharic plays
+into, the other end of the Binharic Mic. Don't pick it in Discord; your output stays your
+headphones. Sometimes PipeWire connects Discord to your real mic even though you picked the
+Binharic Mic, for example while Bluetooth earbuds switch modes. Your friends then hear you
+instead of the screech. A running binharic notices within two seconds and moves Discord
+back, and says so in its log.
 
 ### Hotkeys
 

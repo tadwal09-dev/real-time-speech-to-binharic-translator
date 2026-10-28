@@ -23,7 +23,40 @@ All of that is built and was tested against a simulated desktop (see below). **I
 yet worked end to end on the user's real machine.** The latest report, below, is the
 current blocker.
 
-## Status after the latest session (everything tested on Windows, Arch, Ubuntu and iSH)
+## Status after the latest session (diagnosed on the user's real machine)
+
+The user asked to diagnose why it didn't work on their machine. Findings, all on their real
+desktop:
+
+- **Works:** the GPU (RTX 4060 laptop, CUDA 12 wheels load, Whisper on the GPU, ready in about
+  2 s). The Binharic Mic works too: with a temporary fake mic on their PipeWire, the installed
+  `binharic listen` sent 4/4 phrases, decoded from `binharic_mic`. The earbuds' mic (CMF Buds
+  Pro 2, saved by `fix`) works in headset mode. It sends exact digital zeros between words
+  (the earbuds' noise gate).
+- **The actual failure:** Discord (the web app, in Firefox) had picked the Binharic Mic, but
+  PipeWire linked its stream to the earbuds' mic. The stream's `target.object` was
+  `binharic_mic`, yet it was linked from `bluez_input…`. At 20:59:54 the Bluetooth transport
+  failed as the earbuds switched modes. A second later WirePlumber logged "link failed: 1 of
+  1 PipeWire links failed to activate" and fell back to the default source, with no retry.
+  `pactl move-source-output <idx> binharic_mic` fixed it live; decoded screeches then came
+  out of the Binharic Mic.
+- **Fix:** the layer's new `guard` thread (and `binharic fix`) moves such streams back
+  (`pulse.misrouted_mic_streams`). It gives up after 3 tries per incident and tells the user
+  what to do. Unit tests cover it. There's no e2e case: a failed link can't be forced on
+  purpose. Streams wired by hand with `pw-link` aren't moved by `pactl`, and a target that
+  doesn't exist yet is relinked by WirePlumber itself, so neither reproduces it.
+- **`/usr/local/bin/binharic`:** the user's Hyprland session PATH lacks `~/.local/bin`.
+  `install.sh` now links `binharic` there too, with sudo, and `--uninstall` removes it.
+- **Bluetooth:** a MediaTek adapter. Every switch between music (A2DP) and headset (HFP) mode
+  logs "Failure in Bluetooth audio transport". The kernel also logs "SCO packet for unknown
+  connection handle". WirePlumber switches modes whenever anything opens the earbuds' mic
+  (`bluetooth.autoswitch-to-headset-profile` is on).
+- **Not done yet:** a live `binharic test` with the user talking into the earbuds while
+  devices are logged (`live_diag.py`, a scratch script). Possible false alarm: if the user
+  says nothing for the first 5 s, the "microphone is silent" check (peak < 3e-4) could fire
+  on the earbuds' digital zeros.
+
+## Status after the session before (everything tested on Windows, Arch, Ubuntu and iSH)
 
 The user asked to "test every function on Windows and Linux, fix everything, and loop until
 it passes 3 times in a row on all systems, then ship to main and write a file describing what
@@ -95,7 +128,7 @@ everything does". Done in this session:
   container gets `SYS_NICE`). Local docker runs without realtime are flaky for this reason
   alone.
 
-## Status after the session before (Windows, iSH, `binharic fix`, faster default)
+## Status two sessions before (Windows, iSH, `binharic fix`, faster default)
 
 Added in response to the user's report (a Bluetooth-earbud mic that delivers nothing, a
 CUDA download that keeps dropping, and "doctor doesn't work"):
@@ -140,10 +173,10 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
   **Not yet run in a real iSH**; tested by forcing iSH mode on Linux.
 
 ### Still open / next steps
-1. The user needs to `git pull`, run `./install.sh` (or just `binharic fix`), and paste the
-   output. The key unknown: does the CMF Buds Pro 2 mic work in headset mode? If not,
-   `fix` recommends the built-in or a wired mic.
-2. Confirm that the resumable CUDA download finishes on their connection, and measure GPU latency.
+1. Done since: the CMF Buds Pro 2 mic works in headset mode (`fix` saved it), and the CUDA
+   libraries installed and load. GPU latency with real speech is still unmeasured.
+2. Confirm with the user's friend that Discord carries the screech now. Next suspects:
+   Discord's noise suppression, echo cancellation, AGC, and automatic input sensitivity.
 3. Windows passes the e2e suite on a GitHub runner (Windows Server, VB-Cable), but a real
    PC with real hardware and Discord, and a real iSH on an iPhone, are still untested.
 
@@ -151,10 +184,13 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 
 - Arch Linux, PipeWire, user `tadwa`, repo cloned at `~/real-time-speech-to-binharic-translator`
 - The system Python is 3.14, so the installer uses uv to build a Python 3.12 environment
-  at `~/.local/share/binharic/venv`, linked to `~/.local/bin/binharic`
+  at `~/.local/share/binharic/venv`, linked to `~/.local/bin/binharic` and `/usr/local/bin/binharic`.
+  Their Hyprland session's PATH lacks `~/.local/bin` (only `~/.bashrc` adds it), so keybinds and
+  launchers need the `/usr/local/bin` link. `binharic` works from any folder: no `cd` into the repo
 - Arch's `python-pipx` is broken on their machine (missing `filelock`), so we don't use pipx
-- They have an NVIDIA GPU and a working driver, but no CUDA 12 cuBLAS/cuDNN yet (point 3 above)
-- Their default audio device is the Bluetooth earbuds "CMF Buds Pro 2"
+- NVIDIA RTX 4060 laptop GPU, 16 CPU threads; the CUDA 12 wheels are installed and Whisper runs on the GPU
+- Their default audio device is the Bluetooth earbuds "CMF Buds Pro 2" (MediaTek Bluetooth adapter)
+- They use Discord's web app in Firefox, and kitty + bash on Hyprland
 - They paste terminal output back; give exact commands to run
 
 ## Layout
