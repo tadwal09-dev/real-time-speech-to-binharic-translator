@@ -18,16 +18,26 @@ jobs:
           pip install numpy sounddevice
           python -c "import sounddevice as sd; print(sd.query_devices()); print(sd.query_hostapis())"
         shell: pwsh
-      - name: play into CABLE Input, record CABLE Output
+      - name: play into CABLE Input, record CABLE Output (each host API, separate streams)
         shell: python
         run: |
-          import numpy as np, sounddevice as sd
-          devs = sd.query_devices()
-          out = next(i for i, d in enumerate(devs) if d["name"].startswith("CABLE Input") and d["max_output_channels"])
-          inp = next(i for i, d in enumerate(devs) if d["name"].startswith("CABLE Output") and d["max_input_channels"])
+          import time, threading, numpy as np, sounddevice as sd
+          devs, apis = sd.query_devices(), sd.query_hostapis()
+          for d in devs:
+              print(d["index"], d["name"], apis[d["hostapi"]]["name"], d["default_samplerate"])
           t = np.arange(48000) / 48000
           sig = (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
-          rec = sd.playrec(np.concatenate([np.zeros(12000, np.float32), sig, np.zeros(12000, np.float32)]).reshape(-1, 1),
-                           samplerate=48000, channels=1, dtype="float32", device=(inp, out))
-          sd.wait()
-          print("peak through the cable:", float(np.abs(rec).max()))
+          for api in ("MME", "Windows DirectSound", "Windows WASAPI"):
+              try:
+                  out = next(i for i, d in enumerate(devs) if d["name"].startswith("CABLE Input") and apis[d["hostapi"]]["name"] == api)
+                  inp = next(i for i, d in enumerate(devs) if d["name"].startswith("CABLE Output") and apis[d["hostapi"]]["name"] == api)
+                  got = []
+                  ins = sd.InputStream(samplerate=48000, channels=1, dtype="float32", device=inp,
+                                       callback=lambda d, f, tt, s: got.append(d.copy()))
+                  ins.start(); time.sleep(0.3)
+                  sd.play(sig, samplerate=48000, device=out, blocking=True)
+                  time.sleep(0.5); ins.stop(); ins.close()
+                  x = np.concatenate(got)
+                  print(api, "OK peak", float(np.abs(x).max()), "seconds", len(x) / 48000)
+              except Exception as e:
+                  print(api, "FAILED", repr(e))
