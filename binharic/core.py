@@ -29,7 +29,7 @@ from typing import Callable
 
 import numpy as np
 
-from . import codec, modem, pulse
+from . import codec, modem, osinfo, pulse
 from .audio import Input, Output
 from .stt import LIVE, PHRASE, STT_SR, Transcriber, make_engine
 from .vad import Decimator
@@ -74,10 +74,27 @@ class Settings:
         return d
 
 
+# Linux: a unix socket. Windows Python has no AF_UNIX, so there it's TCP on
+# localhost, with the port written next to where the socket would be.
+UNIX_SOCKETS = hasattr(socket, "AF_UNIX") and not osinfo.WINDOWS
+
+
 def socket_path() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/binharic-{os.getuid()}"
-    Path(base).mkdir(parents=True, exist_ok=True)
-    return Path(base) / "binharic.sock"
+    return osinfo.runtime_dir() / ("binharic.sock" if UNIX_SOCKETS else "binharic.port")
+
+
+def _connect(timeout: float) -> socket.socket:
+    if UNIX_SOCKETS:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(str(socket_path()))
+        except OSError:
+            s.close()
+            raise
+        return s
+    port = int(socket_path().read_text().strip())  # OSError/ValueError if nothing is running
+    return socket.create_connection(("127.0.0.1", port), timeout=timeout)
 
 
 def desktop_notify(text: str) -> None:
@@ -88,12 +105,9 @@ def desktop_notify(text: str) -> None:
 
 
 def send_command(cmd: str, timeout: float = 3.0) -> str:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
     try:
-        s.connect(str(socket_path()))
-    except OSError:
-        s.close()
+        s = _connect(timeout)
+    except (OSError, ValueError):
         raise RuntimeError("binharic is not running (start `binharic listen`, `tui` or `gui`)") from None
     with s:
         s.sendall(cmd.encode() + b"\n")
@@ -128,6 +142,9 @@ class Translator:
         self._warned_half = False
         self.fatal: str | None = None
         self.speakers: str | None = None
+        self._on_pulse = False
+        self.virtual = False          # the screech goes to a virtual mic (PipeWire's or VB-Cable)
+        self._speaker_device = None   # PortAudio device for your speakers (test mode)
         self.speakers_label = "default output"
         self.mic_label = "default input"
         self._stopped_once = False
@@ -166,7 +183,7 @@ class Translator:
         if self.s.test:
             return False  # test mode screeches on your speakers, which the mic can hear
         if self.s.duplex == "auto":
-            return bool(self.s.sink)  # a virtual sink can't leak back into the mic
+            return self.virtual  # a virtual mic can't leak back into the real one
         return self.s.duplex == "full"
 
     # -- controls ---------------------------------------------------------
@@ -257,7 +274,8 @@ class Translator:
             self._start_control()  # first, so a second copy fails before touching audio
         self._resolve_devices()
         warn = lambda m: self.log(m, "warn")  # noqa: E731
-        self._out = Output(SR, sink=self.s.sink or self.speakers, device=self.s.output_device, blocksize=BLOCK,
+        on_pulse = self._on_pulse
+        self._out = Output(SR, sink=(self.s.sink if on_pulse else None) or (self.speakers if on_pulse else None), device=self.s.output_device, blocksize=BLOCK,
                            notify=warn, before_reconnect=self._recreate_virtual_mic)
         self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2, notify=warn)
         out = pulse.describe(self.s.sink, "sinks") if self.s.sink else self.speakers_label
@@ -341,8 +359,13 @@ class Translator:
         self.speakers = None
         self.speakers_label = "default output"
         self.mic_label = self.s.input_device or "default input"
+        self._speaker_device = self.s.output_device
         if not pulse.available():
+            self._on_pulse = False
+            self._resolve_portaudio()
             return
+        self._on_pulse = True
+        self.virtual = bool(self.s.sink)  # any named sink: the Binharic Mic or one you chose
         if self.s.sink == pulse.SINK and not pulse.virtual_mic_exists():
             pulse.mic_up()
         # wrong names: say so now, with the list of real ones
@@ -360,6 +383,27 @@ class Translator:
             self.speakers = pulse.real_sink()
             if self.speakers:
                 self.speakers_label = pulse.describe(self.speakers, "sinks")
+
+    def _resolve_portaudio(self) -> None:
+        """Windows (or Linux without PipeWire): PortAudio devices by name, and
+        VB-Audio's Virtual Cable as the virtual mic."""
+        from . import pa
+        self.virtual = bool(self.s.sink) and self.s.sink != "default"
+        if self.virtual:
+            return  # an explicitly named virtual device (tests, or set up by hand)
+        if self.s.input_device not in (None, ""):
+            self.mic_label = str(self.s.input_device)
+            self.s.input_device = pa.resolve(self.s.input_device, "input")
+        if self.s.output_device not in (None, ""):
+            self.s.output_device = self._speaker_device = pa.resolve(self.s.output_device, "output")
+        elif self.s.sink != "default":
+            cable = pa.find_cable()
+            if cable is not None:
+                self.s.output_device, self.virtual = cable, True
+                self.s.sink = "VB-Audio Virtual Cable"
+            elif osinfo.WINDOWS:
+                self.log("no virtual cable found: the screech plays on your speakers. For Discord, install "
+                         f"VB-Audio Virtual Cable ({pa.CABLE_URL}) and pick 'CABLE Output' as your mic", "warn")
 
     def _recreate_virtual_mic(self) -> None:
         """After a sound-server restart the virtual devices are gone: rebuild
@@ -494,11 +538,11 @@ class Translator:
 
     def _target(self) -> Output:
         """Where the screech goes: the Binharic Mic, or your speakers in test mode."""
-        if not self.s.test or not self.s.sink:
+        if not self.s.test or not self.virtual:
             return self._out
         with self._target_lock:  # the GUI thread and the output thread can both get here
             if self._local_out is None:
-                self._local_out = Output(SR, sink=self.speakers, device=self.s.output_device, blocksize=BLOCK,
+                self._local_out = Output(SR, sink=self.speakers, device=self._speaker_device, blocksize=BLOCK,
                                          notify=lambda m: self.log(m, "warn"))
         return self._local_out
 
@@ -625,9 +669,14 @@ class Translator:
             else:
                 raise RuntimeError("binharic is already running (the background service?) - "
                                    "control it with `binharic toggle`, or `systemctl --user stop binharic`")
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.bind(str(path))
-        os.chmod(path, 0o600)
+        if UNIX_SOCKETS:
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._sock.bind(str(path))
+            os.chmod(path, 0o600)
+        else:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.bind(("127.0.0.1", 0))
+            path.write_text(str(self._sock.getsockname()[1]))
         self._sock.listen(4)
         self._spawn(self._control_loop, "control")
 

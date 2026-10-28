@@ -1,7 +1,7 @@
 # Handoff: where we left off
 
 Read this first in a new session, then the README for what the user sees.
-Last updated: 2026-10-27, after commit `d19ee73` on branch `claude/happy-gates-btt1f9`.
+Last updated: 2026-10-28 on branch `claude/happy-gates-btt1f9`.
 
 ## What this is
 
@@ -23,53 +23,54 @@ All of that is built and was tested against a simulated desktop (see below). **I
 yet worked end to end on the user's real machine.** The latest report, below, is the
 current blocker.
 
-## Latest report from the user's machine (the next thing to fix)
+## Status after the latest session (Windows, iSH, `binharic fix`, faster default)
 
-`./install.sh`, `binharic doctor` and `binharic test --fast` on their PC:
+Added in response to the user's report (a Bluetooth-earbud mic that delivers nothing, a
+CUDA download that keeps dropping, and "doctor doesn't work"):
 
-1. **The mic delivers no audio.** Their default input and output is a **Bluetooth headset,
-   "CMF Buds Pro 2"**. Here's what happened:
-   - `doctor` showed `microphone: CMF Buds Pro 2 (level 0.000)`, then `couldn't record
-     from it`.
-   - Test mode said "the microphone isn't delivering any audio".
-   - It stayed deaf; nothing was transcribed.
+- **`binharic fix`** (`binharic/fix.py`) actually repairs things. It:
+  - starts PipeWire
+  - creates the Binharic Mic and undoes any defaults PipeWire hijacked
+  - unmutes the mic and raises a low volume
+  - switches Bluetooth earbuds from A2DP to headset mode (msbc preferred)
+  - probes every mic *while the user talks* and **saves the one that hears them** to
+    `~/.config/binharic/config.json`, which `_settings` uses as the default source or input device
+  - plays a screech into the Binharic Mic and decodes it from the other end
+  - downloads the models
+  - downloads the CUDA wheels with **HTTP-range resume** and checks their sha256, then
+    `uv pip install --no-deps`
 
-   The likely cause is Bluetooth profiles. In A2DP (the high-quality playback profile)
-   the earbuds have no working mic. The mic only works in the HSP/HFP "headset head unit"
-   profile. Recording from it may make WirePlumber switch profiles, which restarts the
-   stream. That would explain the 1-second probe getting nothing, and the
-   "lost the audio connection… reconnected" message.
-   - To do: detect a `bluez_input.*` / `bluez_card.*` source in `pulse.py` and `doctor`.
-     Check the card's active profile with `pactl list cards`. If it isn't a headset
-     profile, explain that and offer the fix
-     (`pactl set-card-profile bluez_card.XX headset-head-unit`, or the pavucontrol
-     Configuration tab). Or suggest the laptop's built-in mic with `--source`.
-   - Consider preferring a non-Bluetooth hardware mic in `pulse.real_source()` when the
-     Bluetooth device is in A2DP. The probe in `pulse.probe_source` should also wait
-     longer (about 3 s) for Bluetooth.
-   - Ask the user for `pactl list cards short`, `pactl list sources short` and
-     `binharic devices`. Whether the mic works after a profile switch is still unknown.
+  The installers now run `fix` at the end. `doctor` stays as a read-only check and points
+  to `fix`.
+- **Ctrl+C bug fixed:** the pacat/parec children now run with `start_new_session=True`.
+- **Faster by default:** without a usable GPU, `listen`, `test`, `gui` and `tui` use the
+  `--fast` setup automatically (`base.en` only, greedy). `--accurate` restores `small.en`.
+  With the GPU working (via `fix`), the default is `small.en`.
+- **Windows** (`install.ps1`, `binharic/pa.py`):
+  - PortAudio devices
+  - VB-Audio Virtual Cable as the virtual mic: we play into "CABLE Input", Discord records
+    from "CABLE Output"
+  - the control socket is TCP on localhost with a port file (Windows Python has no AF_UNIX)
+  - no fcntl, no SIGHUP
+  - `windows-curses` dependency; CUDA DLLs via `os.add_dll_directory`
 
-2. **Bug: Ctrl+C kills the `parec`/`pacat` child processes.** The user pressed Ctrl+C and
-   got "lost the audio connection (the audio tool exited); reconnecting… audio
-   reconnected" while it was shutting down. In `audio._PulseStream._spawn` the children
-   share the terminal's process group, so the terminal's SIGINT reaches them too. The fix
-   is `start_new_session=True` in the `Popen` call; we close the children ourselves in
-   `close()`. Also, `recover()` shouldn't reconnect while a stop is underway.
+  **None of this has been run on real Windows**; it's tested on Linux with fakes in
+  `tests/test_platforms.py`.
+- **iSH** (`install-ish.sh`, `binharic/ish.py`):
+  - detected through `uname`/`/proc/ish`, or the `BINHARIC_ISH=1` override
+  - text in (iOS keyboard dictation), WAV files out to `~/binharic`
+  - Voice Memos m4a decoded through ffmpeg
+  - live modes refuse with an explanation
+  - installs with Alpine's py3-numpy and `pip --no-deps`
 
-3. **The CUDA libraries won't download.** `uv pip install '.[gpu]'` fails every retry with
-   "connection reset" partway through `nvidia-cudnn-cu12` (about 700 MB) and
-   `nvidia-cublas-cu12`. Their network drops long downloads, and uv can't resume. Options:
-   - download the wheels with resumable `curl -C -` (or `wget -c`) into
-     `~/.local/share/binharic/wheels`, then `uv pip install` the files
-   - point the user at Arch's `cuda`/`cudnn` packages, but check the CUDA major version
-     (CTranslate2 needs cuBLAS 12 and cuDNN 9)
+  **Not yet run in a real iSH**; tested by forcing iSH mode on Linux.
 
-   Until then, Whisper falls back to the CPU on its own, with a clear warning (that part
-   worked on their machine). `BINHARIC_NO_GPU=1 ./install.sh` skips the attempt.
-
-What *did* work on their machine: the installer (uv on Python 3.12), the model downloads,
-`mic up`, the GPU-to-CPU fallback, and the test-mode startup.
+### Still open / next steps
+1. The user needs to `git pull`, run `./install.sh` (or just `binharic fix`), and paste the
+   output. The key unknown: does the CMF Buds Pro 2 mic work in headset mode? If not,
+   `fix` recommends the built-in or a wired mic.
+2. Confirm that the resumable CUDA download finishes on their connection, and measure GPU latency.
+3. First real runs on Windows and in iSH will probably turn up platform bugs.
 
 ## The user's environment
 
@@ -93,10 +94,12 @@ What *did* work on their machine: the installer (uv on Python 3.12), the model d
 | `binharic/codec.py` | Frame format (magic/mode/flags, nonce plus key check, length, CRC-16), SHA-256 keystream, `split_text` (240-byte chunks) |
 | `binharic/audio.py` | pacat/parec streams (errors at start, reconnect, `ensure_alive`), with PortAudio as the fallback; WAV input/output |
 | `binharic/pulse.py` | `pactl` helpers: create/remove the virtual mic (and restore the defaults), `real_source`/`real_sink` (never our own virtual devices), `check_device`, `probe_source` |
+| `binharic/fix.py` | `binharic fix`: the real repair tool (see status above), including resumable wheel downloads |
+| `binharic/osinfo.py`, `pa.py`, `ish.py` | Platform detection and saved config; PortAudio and VB-Cable helpers (Windows); iSH mode |
 | `binharic/gpu.py` | Loads the CUDA 12 libraries from the pip wheels without `LD_LIBRARY_PATH` |
 | `binharic/ui_cli.py`, `ui_tui.py`, `ui_gui.py` | The log, curses and Tk front ends |
 | `install.sh`, `contrib/` | Installer (pacman, uv, models, mic, doctor, `--uninstall`), user systemd unit, desktop entry |
-| `tests/` | 79 tests. `test_fixes.py` holds the regressions from the full test pass |
+| `tests/` | 87 tests; `test_platforms.py` covers Windows/iSH/fix with fakes. `test_fixes.py` holds the regressions from the full test pass |
 
 ## How it was tested (rebuild this; the scripts were in a session scratch folder)
 

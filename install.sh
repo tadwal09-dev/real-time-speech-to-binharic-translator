@@ -53,11 +53,6 @@ if ! retry uv pip install --python "$VENV/bin/python" --upgrade '.[all]'; then
 else
   ENGINE=whisper
 fi
-if [[ $ENGINE == whisper && -e /proc/driver/nvidia/version && -z "${BINHARIC_NO_GPU:-}" ]]; then
-  step "NVIDIA GPU found: installing CUDA 12 libraries for Whisper (~1.5 GB, skip with BINHARIC_NO_GPU=1)"
-  retry uv pip install --python "$VENV/bin/python" --upgrade '.[all,gpu]' \
-    || echo "!! couldn't install the CUDA libraries; Whisper will run on the CPU instead"
-fi
 ln -sf "$VENV/bin/binharic" "$BIN"
 "$BIN" --help >/dev/null || fail "binharic was installed but doesn't start"
 
@@ -78,8 +73,8 @@ fi
 step "creating the Binharic Mic"
 "$BIN" mic up || echo "!! couldn't create it now - is PipeWire running? try later: binharic mic up"
 
-step "checking"
-"$BIN" doctor
+step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
+if [[ -n "${BINHARIC_NO_GPU:-}" ]]; then "$BIN" fix --no-gpu || true; else "$BIN" fix || true; fi
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

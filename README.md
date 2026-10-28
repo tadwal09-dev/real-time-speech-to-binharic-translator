@@ -34,6 +34,62 @@ The installer does five things:
 Nothing you say is sent to the cloud. To update, `git pull` and run `./install.sh`
 again. `./install.sh --uninstall` removes it.
 
+## Something not working? `binharic fix`
+
+```sh
+binharic fix          # asks you to talk, then fixes what it can
+binharic fix --yes    # don't ask, just fix
+```
+
+`binharic doctor` only lists problems. `binharic fix` tests everything for real and repairs it:
+
+* starts PipeWire if it's down
+* creates the Binharic Mic, and puts your normal speakers and mic back as the defaults if
+  PipeWire switched them to the virtual devices
+* unmutes your mic and turns it up if it's at a low volume
+* **Bluetooth earbuds:** in music (A2DP) mode they have no working mic, so it offers to
+  switch them to headset mode
+* records from **each microphone while you talk**, picks one that actually hears you, and
+  **saves it**, so every command uses it from then on
+* plays a test screech into the Binharic Mic and decodes what comes out, the same thing
+  Discord would receive
+* downloads missing speech models, and the NVIDIA GPU libraries **in resumable pieces**:
+  a dropped connection picks up where it stopped instead of starting the 1.5 GB over
+
+## Windows
+
+In PowerShell, from the repo folder:
+
+```powershell
+git clone -b claude/happy-gates-btt1f9 https://github.com/tadwal09-dev/real-time-speech-to-binharic-translator.git
+cd real-time-speech-to-binharic-translator
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+It installs uv and a private Python, plus Whisper, a `binharic` command and a Start-menu
+shortcut, then runs `binharic fix`. For Discord, install the free
+**[VB-Audio Virtual Cable](https://vb-audio.com/Cable/)** (as administrator, then reboot).
+binharic plays into "CABLE Input"; pick **"CABLE Output"** as your mic in Discord. Everything
+else (GUI, TUI, `test`, hotkey commands) works the same as on Linux.
+
+## iPhone / iPad (iSH)
+
+iSH is a Linux terminal app for iOS, but it can't use the phone's microphone or speaker,
+and it's far too slow for speech recognition. So the phone does those parts:
+
+* **talking:** tap the keyboard's **mic key** and dictate (or type), then press Enter
+* **sound:** each line becomes a WAV file. Play it from the Files app
+  (iSH → root → binharic; `latest.wav` is always the newest), or share/AirDrop it
+* **decoding:** record a screech with Voice Memos, save it to Files → iSH, then run
+  `binharic decode --wav ~/recording.m4a`
+
+```sh
+apk add git
+git clone -b claude/happy-gates-btt1f9 https://github.com/tadwal09-dev/real-time-speech-to-binharic-translator.git
+cd real-time-speech-to-binharic-translator && sh install-ish.sh
+binharic
+```
+
 ## Three ways to run it
 
 | Command | What you get |
@@ -153,8 +209,9 @@ Measured on a 4-core CPU, from when you stop talking to the first screech sound:
 
 | Settings | Latency | Accuracy |
 |---|---|---|
-| default (`small.en`) | about 4.0 s | best |
-| `--fast` (`base.en`, greedy, no live transcript) | **about 1.4 s** | very good |
+| **default without a working GPU** (`base.en`, greedy, no live transcript; same as `--fast`) | **about 1.4 s** | very good |
+| `--accurate` on the CPU (`small.en`) | about 4.0 s | best |
+| default with a working NVIDIA GPU (`small.en`) | expected to be a few hundred ms (not measured) | best |
 | `--fast --model tiny.en` | about 0.9 s | poor |
 | any model with `--device cuda` (NVIDIA GPU) | a few hundred ms | same as the model |
 

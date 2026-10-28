@@ -296,8 +296,7 @@ def test_test_mode_plays_locally_verifies_and_times(monkeypatch, tmp_path):
     assert sent and sent[0]["text"] == "testing one two" and sent[0]["test"]
     assert 0 < sent[0]["latency_ms"] < 5000 and sent[0]["speculative"]
     assert verify[0]["ok"] and verify[0]["decoded"] == "testing one two"
-    sink_out = next(o for o in outs if o.sink == "binharic_out")
-    local = next(o for o in outs if o.sink is None)
+    sink_out, local = outs[0], outs[1]  # the virtual mic first, your speakers opened for test mode
     # the virtual mic got nothing; your speakers got the screech
     assert not sink_out.blocks or np.abs(np.concatenate(sink_out.blocks)).max() == 0
     played = np.concatenate(local.blocks)

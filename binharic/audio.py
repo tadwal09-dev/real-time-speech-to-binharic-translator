@@ -12,7 +12,6 @@ Two backends:
 from __future__ import annotations
 
 import collections
-import fcntl
 import shutil
 import subprocess
 import sys
@@ -29,8 +28,9 @@ RECONNECT_SECONDS = 30.0
 
 def _small_pipe(f, size: int = 4096) -> None:
     try:
+        import fcntl  # Linux only
         fcntl.fcntl(f.fileno(), F_SETPIPE_SZ, size)
-    except OSError:
+    except (ImportError, OSError):
         pass
 
 
@@ -64,7 +64,10 @@ class _PulseStream:
 
     def _spawn(self) -> subprocess.Popen:
         proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE if self.playback else subprocess.DEVNULL,
-                                stdout=None if self.playback else subprocess.PIPE, stderr=subprocess.PIPE)
+                                stdout=None if self.playback else subprocess.PIPE, stderr=subprocess.PIPE,
+                                # own session: Ctrl+C in the terminal must not kill the audio
+                                # tools under us; we close them ourselves on the way out
+                                start_new_session=True)
         if self.playback:
             _small_pipe(proc.stdin)
 

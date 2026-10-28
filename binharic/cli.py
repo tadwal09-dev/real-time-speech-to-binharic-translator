@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import shutil
 import signal
@@ -20,6 +21,7 @@ import sys
 import numpy as np
 
 from . import codec, modem
+from .osinfo import ISH
 
 SR = modem.DEFAULT_SR
 
@@ -39,11 +41,14 @@ def esc(text: object) -> str:
     return _rich_escape(str(text))
 
 
+_STYLE_TAG = re.compile(r"\[/?(?:bold|dim|green|red|yellow|cyan)(?: (?:green|red|yellow|cyan))?\]|\[/\]")
+
+
 def say_line(markup: str, plain: str | None = None) -> None:
     if console:
         console.print(markup)
-    else:
-        print(plain if plain is not None else markup)
+    else:  # no rich (e.g. iSH): drop our style tags rather than print them
+        print(plain if plain is not None else _STYLE_TAG.sub("", markup))
 
 
 # argument checks: a bad value gets a one-line error, not a traceback
@@ -77,9 +82,17 @@ def _settings(args):
     from .core import Settings
     from .stt import LIVE, PHRASE, resolve_engine
 
+    from .osinfo import load_config
+
+    cfg = load_config()  # what `binharic fix` found to work
     sink = pulse.resolve_sink(args.sink)
     model, live_model, beam, pause, partials = args.model, args.live_model, 5, args.pause_ms, True
-    if args.fast:
+    fast = args.fast
+    if not fast and not args.accurate and not args.model and resolve_engine(args.engine) == "whisper":
+        # no usable GPU: the quick single-model setup is the default (`--accurate` for the careful one)
+        from . import gpu
+        fast = args.device == "cpu" or not (gpu.cuda_devices() > 0 and gpu.libs_available())
+    if fast:
         # one quick model, greedy decoding, shorter pause, no interim transcripts
         beam, partials, pause = 1, False, min(pause, 450)
         if resolve_engine(args.engine) == "whisper":
@@ -90,8 +103,8 @@ def _settings(args):
         mode=args.mode, key=_key(args.key), speed=args.speed, volume=args.volume,
         passthrough=args.passthrough, engine=args.engine, model=model, live_model=live_model,
         device=args.device, beam=beam, partials=partials, language=args.language, test=getattr(args, "test_mode", False), test_air=getattr(args, "air", False),
-        sink=sink, source=pulse.resolve_source(args.source),
-        output_device=args.output_device, input_device=args.input_device,
+        sink=sink, source=pulse.resolve_source(args.source) or (cfg.get("source") if not args.input_device else None),
+        output_device=args.output_device, input_device=args.input_device or cfg.get("input_device"),
         duplex=args.duplex, end_ms=pause,
         hear=pulse.resolve_source(args.hear), hear_key=_key(args.hear_key) if args.hear_key else None,
     )
@@ -105,7 +118,9 @@ def _translator(args):
 def _run_ui(run, tr, **kw):
     # `systemctl --user stop`, closing the terminal, `kill`: shut down cleanly
     # (close the audio, remove the control socket) instead of just dying
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):  # no SIGHUP on Windows
+        if sig is None:
+            continue
         signal.signal(sig, lambda *_: tr.request_stop())
     try:
         run(tr, **kw)
@@ -119,12 +134,31 @@ def _run_ui(run, tr, **kw):
     return tr.fatal
 
 
+def _no_live_audio_on_ish():
+    if ISH:
+        sys.exit("iSH can't use the iPhone's mic or speaker, so live modes don't work here.\n"
+                 "Use `binharic ish` (dictate or type -> sound files), `binharic say`, `binharic decode --wav`.")
+
+
+def cmd_ish(args):
+    from . import ish
+    ish.run(mode=getattr(args, "mode", "binharic"), key=_key(getattr(args, "key", None)),
+            speed=getattr(args, "speed", 1.0))
+
+
+def cmd_fix(args):
+    from . import fix
+    sys.exit(fix.run(yes=args.yes, gpu=not args.no_gpu))
+
+
 def cmd_listen(args):
+    _no_live_audio_on_ish()
     from . import ui_cli
     return _run_ui(ui_cli.run, _translator(args), show=getattr(args, "show", "text"))
 
 
 def cmd_test(args):
+    _no_live_audio_on_ish()
     from . import ui_cli
     from .core import send_command
     try:
@@ -145,11 +179,13 @@ def cmd_test(args):
 
 
 def cmd_tui(args):
+    _no_live_audio_on_ish()
     from . import ui_tui
     return _run_ui(ui_tui.run, _translator(args))
 
 
 def cmd_gui(args):
+    _no_live_audio_on_ish()
     try:
         import tkinter  # noqa: F401
     except ImportError:
@@ -160,6 +196,8 @@ def cmd_gui(args):
 
 def cmd_pick(args):
     """No subcommand: start the GUI on a desktop, the TUI in a terminal."""
+    if ISH:
+        return cmd_ish(args)
     if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
         try:
             import tkinter  # noqa: F401
@@ -203,6 +241,11 @@ def cmd_say(args):
     text = " ".join(text.split())
     if not text:
         sys.exit("nothing to say: binharic say \"your message\"  (or pipe text in)")
+    if ISH and not args.wav:
+        from . import ish
+        path = ish.to_wav(text, args.mode, _key(args.key), args.speed)
+        say_line(f"[green]wrote[/] {esc(path)} [dim](play it from the Files app: iSH -> root -> binharic)[/]")
+        return
     if not args.wav and not args.direct:
         # a running layer owns the Binharic Mic: queue it there rather than
         # playing a second stream over (and garbling) whatever it's sending
@@ -223,9 +266,13 @@ def cmd_say(args):
         return
     from .audio import Output
     sink = pulse.resolve_sink(args.sink)
-    if sink is None and not args.output_device and pulse.available():
+    device = args.output_device
+    if sink is None and not device and pulse.available():
         sink = pulse.real_sink()  # PipeWire directly: PortAudio over ALSA is unreliable there
-    out = Output(SR, sink=sink, device=args.output_device)
+    elif sink is None and not device and args.sink == "auto":
+        from . import pa
+        device = pa.find_cable() if pa.available() else None  # Windows: VB-Cable is the virtual mic
+    out = Output(SR, sink=sink, device=device)
     try:
         out.write(audio)
         out.write(np.zeros(SR // 4, dtype=np.float32))
@@ -238,7 +285,8 @@ def cmd_decode(args):
     key = _key(args.key)
     if args.wav:
         from .audio import read_wav
-        sig, sr = read_wav(args.wav)
+        from .ish import readable
+        sig, sr = read_wav(readable(args.wav))
         msgs = modem.decode_audio(sig, sr, args.mode, key=key, speed=args.speed, threshold=args.threshold)
         if not msgs:
             say_line("[yellow]no transmissions found[/]", "no transmissions found")
@@ -400,6 +448,9 @@ def cmd_doctor(args):
             continue
         say_line(f"  {'[green]✔[/]' if ok else '[red]✖[/]'} {esc(name)}" + ("" if ok else f"  [dim]→ {esc(fix)}[/]"),
                  f"  {'ok ' if ok else 'MISSING'} {name}" + ("" if ok else f"  -> {fix}"))
+    if any(ok is False for _, ok, _ in checks):
+        say_line("\n  [bold]Run `binharic fix` to repair these[/] (it tests your mic for real and fixes what it can).",
+                 "\n  Run `binharic fix` to repair these.")
 
 
 # --------------------------------------------------------------------------
@@ -444,7 +495,10 @@ def _run_options(p, inherit: bool = False):
                                       "(default: detect; .en models are English)")
     g.add_argument("--device", default="auto", help="whisper compute device: auto, cpu, cuda")
     g.add_argument("--fast", action="store_true",
-                   help="lowest latency: base.en only, greedy decoding, 450 ms pause, no live transcript")
+                   help="lowest latency: base.en only, greedy decoding, 450 ms pause, no live transcript "
+                        "(the default without a working GPU)")
+    g.add_argument("--accurate", action="store_true",
+                   help="small.en for the final pass even on the CPU: better words, about 3x slower")
 
     g = p.add_argument_group("audio routing")
     g.add_argument("--sink", default="auto",
@@ -524,7 +578,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_mic)
 
     sub.add_parser("devices", help="list audio sinks, sources and devices").set_defaults(func=cmd_devices)
-    sub.add_parser("doctor", help="check that everything is installed").set_defaults(func=cmd_doctor)
+    sub.add_parser("doctor", help="quick check (no changes; `binharic fix` repairs)").set_defaults(func=cmd_doctor)
+    s = sub.add_parser("fix", help="find problems and FIX them: mic, Bluetooth, virtual mic, models, GPU")
+    s.add_argument("-y", "--yes", action="store_true", help="don't ask, just fix")
+    s.add_argument("--no-gpu", action="store_true", help="skip the (1.5 GB) GPU library download")
+    s.set_defaults(func=cmd_fix)
+    s = sub.add_parser("ish", help="iSH on iOS: dictate or type, get sound files")
+    s.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic")
+    s.add_argument("-k", "--key")
+    s.add_argument("--speed", type=SPEED, default=1.0)
+    s.set_defaults(func=cmd_ish)
 
     s = sub.add_parser("download-model", help="fetch an offline speech model")
     s.add_argument("name", nargs="?", help="e.g. small.en, medium.en, large-v3, or a vosk model name")

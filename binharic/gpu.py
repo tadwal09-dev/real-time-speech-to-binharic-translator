@@ -11,6 +11,7 @@ wrapper is needed.
 from __future__ import annotations
 
 import ctypes
+import sys
 import glob
 import os
 
@@ -33,6 +34,8 @@ def preload_cuda_libs() -> bool:
     global _loaded
     if _loaded:
         return True
+    if sys.platform == "win32":
+        return _preload_windows()
     libs = [p for d in _wheel_lib_dirs() for p in sorted(glob.glob(os.path.join(d, "*.so*")))
             if any(k in os.path.basename(p) for k in ("cublas", "cudnn", "nvrtc", "cudart"))]
     pending = list(libs)
@@ -52,6 +55,21 @@ def preload_cuda_libs() -> bool:
     return _loaded
 
 
+def _preload_windows() -> bool:
+    """Windows: the wheels keep their DLLs in nvidia/*/bin; let Windows find them."""
+    global _loaded
+    try:
+        import nvidia
+    except ImportError:
+        return False
+    for base in getattr(nvidia, "__path__", []):
+        for d in glob.glob(os.path.join(base, "*", "bin")):
+            os.add_dll_directory(d)
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            _loaded = True
+    return _loaded
+
+
 def cuda_devices() -> int:
     try:
         import ctranslate2
@@ -61,12 +79,15 @@ def cuda_devices() -> int:
 
 
 def has_nvidia_driver() -> bool:
+    if sys.platform == "win32":
+        return os.path.exists(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvcuda.dll"))
     return os.path.exists("/proc/driver/nvidia/version")
 
 
 def libs_available() -> bool:
     preload_cuda_libs()
-    for name in ("libcublas.so.12", "libcudnn.so.9"):
+    names = ("cublas64_12.dll", "cudnn64_9.dll") if sys.platform == "win32" else ("libcublas.so.12", "libcudnn.so.9")
+    for name in names:
         try:
             ctypes.CDLL(name)
         except OSError:
