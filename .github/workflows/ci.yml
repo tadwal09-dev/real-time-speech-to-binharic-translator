@@ -41,6 +41,12 @@ jobs:
           key: models-windows-v1
       - run: .github/scripts/windows-audio.ps1
         shell: pwsh
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: check the cables carry sound faithfully
+        run: |
+          pip install --quiet numpy sounddevice
+          python .github/scripts/windows-audio-check.py
       - run: .github/scripts/windows-e2e.ps1 --repeat $env:REPEAT --artifacts e2e-artifacts
         shell: pwsh
       - uses: actions/upload-artifact@v4
