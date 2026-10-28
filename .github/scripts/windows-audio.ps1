@@ -53,37 +53,53 @@ Start-Sleep 5
 # The Hi-Fi Cable is "bit-perfect": it never resamples, so both of its ends must use
 # the same rate. Out of the box its playback end is 48 kHz and its recording end
 # 44.1 kHz, and everything sent through it arrives warped (drifting, with dropped
-# chunks). Give the recording end the playback end's format.
-$fmt = "{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0"   # PKEY_AudioEngine_DeviceFormat
-$name = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"  # PKEY_Device_DeviceDesc
-$root = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio"
-function Find-Endpoint($kind, $desc) {
-  Get-ChildItem "$root\$kind" | Where-Object {
-    (Get-ItemProperty "$($_.PSPath)\Properties" -ErrorAction SilentlyContinue).$name -eq $desc
-  } | Select-Object -First 1
+# chunks). Set the recording end to 48 kHz the way the Sound control panel does
+# (Recording -> Properties -> Advanced -> Default Format): IPolicyConfig.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+[Guid("f8679f50-850a-41cf-9c72-430f290290c8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPolicyConfig {
+  [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string id, out IntPtr format);
+  [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id, [MarshalAs(UnmanagedType.Bool)] bool deflt, out IntPtr format);
+  [PreserveSig] int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id);
+  [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr endpointFormat, IntPtr mixFormat);
 }
-$render = Find-Endpoint "Render" "Hi-Fi Cable Input"
-$capture = Find-Endpoint "Capture" "Hi-Fi Cable Output"
-if ($render -and $capture) {
-  $blob = (Get-ItemProperty "$($render.PSPath)\Properties").$fmt
-  $edit = @"
-Set-ItemProperty -Path '$($capture.PSPath)\Properties' -Name '$fmt' -Value ([byte[]]@($($blob -join ',')))
-"@
-  try {
-    Set-ItemProperty -Path "$($capture.PSPath)\Properties" -Name $fmt -Value $blob -ErrorAction Stop
-    Write-Host "Hi-Fi Cable: recording end set to the playback end's format"
-  } catch {
-    # the endpoint keys belong to SYSTEM: make the change as SYSTEM
-    $script = Join-Path $env:TEMP "hifi-format.ps1"
-    Set-Content -Path $script -Value $edit
-    schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN hififormat /TR "powershell -NoProfile -ExecutionPolicy Bypass -File $script" | Out-Null
-    schtasks /Run /TN hififormat | Out-Null
-    Start-Sleep 5
-    schtasks /Delete /F /TN hififormat | Out-Null
-    Write-Host "Hi-Fi Cable: recording end set to the playback end's format (as SYSTEM)"
+[ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")] class CPolicyConfigClient {}
+public static class EndpointFormat {
+  // returns "old rate -> new rate" or an error
+  public static string SetRate(string id, int rate) {
+    var pc = (IPolicyConfig)new CPolicyConfigClient();
+    IntPtr cur;
+    int hr = pc.GetDeviceFormat(id, false, out cur);
+    if (hr != 0) return "GetDeviceFormat failed 0x" + hr.ToString("x8");
+    short cbSize = Marshal.ReadInt16(cur, 16);
+    int size = 18 + cbSize;
+    byte[] fmt = new byte[size];
+    Marshal.Copy(cur, fmt, 0, size);
+    int old = BitConverter.ToInt32(fmt, 4);
+    short blockAlign = BitConverter.ToInt16(fmt, 12);
+    BitConverter.GetBytes(rate).CopyTo(fmt, 4);               // nSamplesPerSec
+    BitConverter.GetBytes(rate * blockAlign).CopyTo(fmt, 8);  // nAvgBytesPerSec
+    IntPtr p = Marshal.AllocHGlobal(size);
+    Marshal.Copy(fmt, 0, p, size);
+    hr = pc.SetDeviceFormat(id, p, p);
+    Marshal.FreeHGlobal(p);
+    return hr == 0 ? (old + " Hz -> " + rate + " Hz") : ("SetDeviceFormat failed 0x" + hr.ToString("x8"));
   }
-} else {
-  Write-Host "!! Hi-Fi Cable endpoints not found in the registry"
+}
+"@
+$desc = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"  # PKEY_Device_DeviceDesc
+$mm = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio"
+foreach ($e in @(@{Kind = "Capture"; Flow = "1"; Name = "Hi-Fi Cable Output"}, @{Kind = "Render"; Flow = "0"; Name = "Hi-Fi Cable Input"})) {
+  $key = Get-ChildItem "$mm\$($e.Kind)" | Where-Object {
+    (Get-ItemProperty "$($_.PSPath)\Properties" -ErrorAction SilentlyContinue).$desc -eq $e.Name } | Select-Object -First 1
+  if ($key) {
+    $id = "{0.0.$($e.Flow).00000000}.$($key.PSChildName)"
+    Write-Host "$($e.Name): $([EndpointFormat]::SetRate($id, 48000))"
+  } else {
+    Write-Host "!! endpoint '$($e.Name)' not found"
+  }
 }
 Restart-Service Audiosrv -Force
 Start-Sleep 3

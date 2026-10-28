@@ -194,3 +194,11 @@ def test_redirected_output_never_crashes_on_symbols(monkeypatch):
     cli.say_line("[green]✔[/] ready ▲ ⚙ → 日本")
     out.flush()
     assert "✔ ready ▲ ⚙ → 日本" in raw.getvalue().decode("utf-8")
+
+
+def test_plain_vb_cable_wins_over_cable_a_and_b(monkeypatch):
+    # with VB-Audio's extra cables installed (listed first), the screech must still
+    # go into the plain "CABLE Input" that Discord is told to record from
+    fake_sounddevice(monkeypatch, [("CABLE-A Output (VB-Audio Cable ", 16, 0), ("CABLE-A Input (VB-Audio Cable A", 0, 16),
+                                   ("CABLE Output (VB-Audio Virtual ", 16, 0), ("CABLE Input (VB-Audio Virtual C", 0, 16)])
+    assert pa.find_cable() == 3 and pa.find_cable_output() == 2

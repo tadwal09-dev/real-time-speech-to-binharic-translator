@@ -55,9 +55,11 @@ def _vb_cable(kind: str) -> list[dict]:
     devices are what Discord records (CABLE Output). MME first: its shared mode
     lets Discord and binharic use the cable at the same time."""
     end = "input" if kind == "output" else "output"
-    found = [d for d in devices(kind) if (m := _VB_CABLE.match(d["name"])) and m.group(2).lower() == end]
-    found.sort(key=lambda d: d["hostapi"] != "MME")
-    return found
+    found = [(d, m.group(1)) for d in devices(kind) if (m := _VB_CABLE.match(d["name"])) and m.group(2).lower() == end]
+    # the plain "CABLE" first (the free one, and what the README tells you to pick in
+    # Discord), then CABLE-A/B...; MME first within each
+    found.sort(key=lambda dm: (dm[1] is not None, dm[1] or "", dm[0]["hostapi"] != "MME"))
+    return [d for d, _ in found]
 
 
 def find_cable() -> int | None:
