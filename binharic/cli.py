@@ -212,9 +212,10 @@ def cmd_gui(args):
 
 def cmd_pick(args):
     """No subcommand: start the GUI on a desktop, the TUI in a terminal."""
+    from .osinfo import WINDOWS
     if ISH:
         return cmd_ish(args)
-    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+    if WINDOWS or os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):  # Windows always has a desktop
         try:
             import tkinter  # noqa: F401
         except ImportError:
@@ -674,7 +675,25 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def safe_output() -> None:
+    """Printing ✔ ▲ ⚙ must never crash. Windows writes redirected output (a file,
+    a pipe, a log) in its old code page (cp1252), which has none of them: make
+    that UTF-8. A terminal that can't show a character gets a '?' instead."""
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", "") or "").lower().replace("-", "").replace("_", "")
+        if not stream or enc == "utf8":
+            continue
+        try:
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv=None):
+    safe_output()
     args = build_parser().parse_args(argv)
     code = 0
     try:

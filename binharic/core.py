@@ -757,14 +757,20 @@ class Translator:
             self._sock.bind(("127.0.0.1", 0))
             path.write_text(str(self._sock.getsockname()[1]))
         self._sock.listen(4)
+        # wake up now and then to notice stop(): on Windows, shutting the socket
+        # down doesn't interrupt a waiting accept(), and stopping took 1.5 s longer
+        self._sock.settimeout(0.25)
         self._spawn(self._control_loop, "control")
 
     def _control_loop(self):
         while not self._stop.is_set():
             try:
                 conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 break
+            conn.setblocking(True)
             with conn:
                 conn.settimeout(2.0)  # a client that connects and says nothing can't block hotkeys
                 try:

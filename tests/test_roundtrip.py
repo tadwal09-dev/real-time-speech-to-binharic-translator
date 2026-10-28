@@ -99,3 +99,20 @@ def test_stream_decoder_flush_catches_a_short_tail():
     got += dec.feed(sig[cut - sr // 8:])
     got += dec.flush()
     assert [m.text for m in got] == ["tail end"]
+
+
+def test_live_decoder_never_drops_unsearched_audio():
+    # regression: while nothing was being decoded, the stream decoder trimmed its
+    # buffer past audio it hadn't searched for sync chirps yet, so a message
+    # starting in that gap was lost (live `decode`, --hear and --air missed
+    # messages depending on timing and block size)
+    from binharic import modem
+    sr = 48000
+    msg = modem.encode_text("never lost", "hex", sr=sr, speed=2.0)
+    for lead in (0.05, 0.12, 0.19, 0.27, 0.33, 0.41):
+        for block in (480, 960, 2400, 4800, 9600):
+            sig = np.concatenate([np.zeros(int(lead * sr), np.float32), msg, np.zeros(sr // 2, np.float32)])
+            dec = modem.StreamDecoder(sr, speed=2.0)
+            got = [m.text for i in range(0, len(sig), block) for m in dec.feed(sig[i:i + block])]
+            got += [m.text for m in dec.flush()]
+            assert got == ["never lost"], (lead, block, got)

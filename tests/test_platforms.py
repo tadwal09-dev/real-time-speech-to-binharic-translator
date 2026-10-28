@@ -74,8 +74,11 @@ def test_windows_routes_the_screech_into_the_cable(monkeypatch, tmp_path):
 def test_ish_writes_one_file_per_message(monkeypatch, tmp_path):
     from binharic import ish
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Path.home() on Windows
     paths = [ish.to_wav(f"message {i}") for i in range(3)]  # same second
     assert len(set(paths)) == 3
+    # the Files app lists by name: newer messages must sort after older ones
+    assert sorted(paths) == paths
     from binharic.audio import read_wav
     x, sr = read_wav(str(tmp_path / "binharic" / "latest.wav"))
     assert [m.text for m in modem.decode_audio(x, sr)] == ["message 2"]
@@ -144,3 +147,50 @@ def test_saved_mic_is_used_by_default(monkeypatch, tmp_path):
     assert st.source == "alsa_input.usb-Mic"
     st = cli._settings(cli.build_parser().parse_args(["listen", "--source", "other"]))
     assert st.source == "other"
+
+
+def test_plain_binharic_opens_the_window_on_windows(monkeypatch):
+    # regression: without $DISPLAY (never set on Windows) it fell back to the
+    # terminal dashboard, though the installer says `binharic` opens the window
+    picked = []
+    monkeypatch.setattr(osinfo, "WINDOWS", True)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(cli, "ISH", False)
+    monkeypatch.setattr(cli, "cmd_gui", lambda a: picked.append("gui"))
+    monkeypatch.setattr(cli, "cmd_tui", lambda a: picked.append("tui"))
+    pytest.importorskip("tkinter")
+    cli.cmd_pick(cli.build_parser().parse_args([]))
+    assert picked == ["gui"]
+
+
+def test_vb_cable_is_preferred_over_other_vb_audio_cables(monkeypatch):
+    # regression: on a PC with VB-Audio's Hi-Fi Cable too (listed first), the
+    # screech went into the Hi-Fi Cable and Discord (on CABLE Output) heard nothing
+    fake_sounddevice(monkeypatch, [("Hi-Fi Cable Output (VB-Audio Hi", 8, 0), ("CABLE Output (VB-Audio Virtual ", 16, 0),
+                                   ("Hi-Fi Cable Input (VB-Audio Hi-", 0, 8), ("CABLE In 16ch (VB-Audio Virtual", 0, 16),
+                                   ("CABLE Input (VB-Audio Virtual C", 0, 16)])
+    assert pa.find_cable() == 4 and pa.find_cable_output() == 1
+
+
+def test_device_names_resolve_despite_mme_cutting_them_short(monkeypatch):
+    # Windows lists each device per audio API; MME cuts names to 31 characters
+    fake_sounddevice(monkeypatch, [("CABLE Output (VB-Audio Virtual ", 16, 0),
+                                   ("CABLE Output (VB-Audio Virtual Cable)", 16, 0)])
+    assert pa.resolve("CABLE Output (VB-Audio Virtual Cable)", "input") in (0, 1)
+    assert pa.resolve("CABLE Output", "input") in (0, 1)
+    with pytest.raises(RuntimeError, match="binharic devices"):
+        pa.resolve("Microphone", "input")
+
+
+def test_redirected_output_never_crashes_on_symbols(monkeypatch):
+    # regression: on Windows, `binharic doctor > out.txt` (or any pipe/log)
+    # crashed with UnicodeEncodeError on ✔, because redirected output is cp1252
+    import io
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    cli.safe_output()
+    cli.say_line("[green]✔[/] ready ▲ ⚙ → 日本")
+    out.flush()
+    assert "✔ ready ▲ ⚙ → 日本" in raw.getvalue().decode("utf-8")

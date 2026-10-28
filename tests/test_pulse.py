@@ -1,8 +1,10 @@
 import json
 import os
 import stat
+import sys
 
 import numpy as np
+import pytest
 
 from binharic import core, pulse
 
@@ -19,6 +21,8 @@ SINKS = [
 
 
 def fake_pactl(tmp_path, monkeypatch, default_source, default_sink):
+    if sys.platform == "win32":
+        pytest.skip("fakes pactl with a shell script; PipeWire is Linux only")
     script = tmp_path / "pactl"
     script.write_text(f"""#!/bin/sh
 case "$*" in

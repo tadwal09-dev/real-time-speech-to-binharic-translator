@@ -388,7 +388,7 @@ def ish_text_to_sound_files(ctx):
     env = dict(ctx.env, HOME=str(home))
     r = ctx.bh(input="first line\nsecond line\n\n", env=env)  # no subcommand: the iSH prompt
     check(r.code == 0 and "UNENCRYPTED" in r.out, r)
-    files = sorted((home / "binharic").glob("2*.wav"))
+    files = sorted((home / "binharic").glob("2*.wav"))  # by name, as the Files app shows them
     check(len(files) == 2, f"one WAV per line: {files}")
     got = [ctx.ok("decode", "--wav", str(f)).out.strip() for f in files]
     check(got == ["first line", "second line"], got)
@@ -736,6 +736,8 @@ def _driver(ctx, name: str, timeout: float):
 # == runner =============================================================================
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):  # Windows CI logs are cp1252 otherwise
+        stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("-k", "--only", action="append", default=[], help="run cases whose name contains this")
     ap.add_argument("--skip", action="append", default=[])

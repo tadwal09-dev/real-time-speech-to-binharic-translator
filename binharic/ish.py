@@ -34,12 +34,15 @@ def to_wav(text: str, mode: str = "binharic", key: str | None = None, speed: flo
            decoys: int = 0) -> Path:
     from .audio import write_wav
     audio = modem.encode_text(text, mode, key=key, sr=SR, speed=speed, volume=0.8, decoys=decoys)
+    # the Files app sorts by name: a counter that always sorts after the last
+    # file (never "...-2.wav", which sorts before "....wav") and never overwrites
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = outbox() / f"{stamp}.wav"
-    n = 1
-    while path.exists():  # two messages in the same second must not overwrite each other
+    taken = sorted(p.name for p in outbox().glob(f"{stamp}-*.wav"))
+    n = int(taken[-1][len(stamp) + 1:-4]) + 1 if taken and taken[-1][len(stamp) + 1:-4].isdigit() else 1
+    path = outbox() / f"{stamp}-{n:02d}.wav"
+    while path.exists():
         n += 1
-        path = outbox() / f"{stamp}-{n}.wav"
+        path = outbox() / f"{stamp}-{n:02d}.wav"
     write_wav(str(path), audio, SR)
     latest = outbox() / "latest.wav"
     shutil.copyfile(path, latest)

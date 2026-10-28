@@ -445,8 +445,10 @@ class StreamDecoder:
                     self._cands.pop(p, None)  # not a frame after all (or it never finished)
                 else:
                     self._cands[p] = waiting
-        # keep audio from the oldest open candidate, or a chirp's worth of tail
+        # keep audio from the oldest open candidate, or a chirp's worth of tail;
+        # never anything not yet searched for chirps (it would be lost unseen)
         keep_from = min(self._cands) if self._cands else end - 2 * self._pre_len
+        keep_from = min(keep_from, self._searched - self._pre_len)
         if keep_from > self.base:
             self._drop(keep_from - self.base)
         return out

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -106,7 +107,7 @@ def screenshot(name: str):
         if sys.platform == "win32":
             from PIL import ImageGrab
             ImageGrab.grab().save(path)
-        elif subprocess.run(["which", "import"], capture_output=True).returncode == 0:
+        elif shutil.which("import"):
             subprocess.run(["import", "-window", "root", path], timeout=20)
     except Exception as e:  # noqa: BLE001 - a missing screenshot isn't a test failure
         print(f"(no screenshot: {e})")
@@ -122,7 +123,8 @@ def script(win: Window, tr: core.Translator, rig):
     # power button, and the Space key
     power = win.widget(tk.Button, "● ON · speaking binharic")
     win.ui(power.invoke)
-    check(not s.enabled and win.ui(lambda: power.cget("text")) == "○ OFF", "power off")
+    check(not s.enabled, "power off")
+    wait(lambda: win.ui(lambda: power.cget("text")) == "○ OFF", 3, "the power button to say OFF")
     win.ui(power.invoke)
     check(s.enabled, "power on")
     win.ui(lambda: (win.root.focus_force(), win.root.event_generate("<space>")))
