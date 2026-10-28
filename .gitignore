@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 *.wav
 build/
+!tests/e2e/fixtures/*.wav
+e2e-artifacts/
