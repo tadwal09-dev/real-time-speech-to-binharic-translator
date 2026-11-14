@@ -76,7 +76,8 @@ def test_resampled_playback_drift():
 
 def test_frame_corruption_detected():
     frame = bytearray(codec.build_frame("hello", 2))
-    frame[-3] ^= 0x01
+    for i in range(codec.HEADER_LEN, len(frame), 2):  # far more than the parity can repair
+        frame[i] ^= 0x01
     with pytest.raises(codec.BadFrame):
         codec.parse_frame(bytes(frame))
 

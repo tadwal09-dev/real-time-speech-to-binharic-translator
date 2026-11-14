@@ -34,6 +34,8 @@ def repos(tmp_path, monkeypatch):
     mark = tmp_path / "installed"
     monkeypatch.setattr(update, "source_dir", lambda: user)
     monkeypatch.setattr(update.osinfo, "WINDOWS", False)
+    monkeypatch.setattr(update, "_restart_running", lambda say: None)
+    monkeypatch.setattr(update, "installed_commit", lambda: None)
     monkeypatch.setattr(update, "installer", lambda repo: [
         sys.executable, "-c",
         f"import os; open({str(mark)!r}, 'a').write(os.environ.get('BINHARIC_UPDATE', '') + ' ' + "
@@ -101,3 +103,81 @@ def test_the_clone_is_found_from_the_install_record(tmp_path, monkeypatch):
     assert os.path.samefile(update.source_dir(), clone)
     (clone / ".git").rmdir()
     assert update.source_dir() is None  # installed from a plain folder: can't update itself
+
+
+def test_an_update_that_was_pulled_but_never_installed_is_finished(repos, monkeypatch):
+    # the installer failed half way, or someone ran `git pull` by hand: the clone is new,
+    # what's installed is old. "up to date" would be a lie
+    dev, user, mark = repos
+    old = git(user, "rev-parse", "HEAD")
+    push(dev, "v2\n", "two")
+    git(user, "pull", "-q")
+    monkeypatch.setattr(update, "installed_commit", lambda: old)
+    out = []
+    assert update.run(check=True, say=out.append) == 0
+    assert any("didn't finish" in line for line in out) and not mark.exists()
+    assert update.run(say=out.append) == 0
+    assert mark.read_text() == "1 v2\n"
+    monkeypatch.setattr(update, "installed_commit", lambda: git(user, "rev-parse", "HEAD"))
+    out.clear()
+    assert update.run(say=out.append) == 0 and any("up to date" in line for line in out)
+    assert mark.read_text() == "1 v2\n"  # not installed again
+
+
+def test_force_reinstalls_and_local_edits_dont_block_it(repos):
+    dev, user, mark = repos
+    (user / "README.md").write_text("my own edit\n")
+    assert update.run(force=True, say=lambda t: None) == 0
+    assert mark.read_text() == "1 my own edit\n"  # nothing was pulled, so nothing could be overwritten
+
+
+def test_a_failing_installer_is_reported(repos, monkeypatch):
+    dev, user, mark = repos
+    push(dev, "v2\n", "two")
+    monkeypatch.setattr(update, "installer", lambda repo: [sys.executable, "-c", "raise SystemExit(3)"])
+    out = []
+    assert update.run(say=out.append) == 3 and any("installer failed" in line for line in out)
+
+
+def test_a_clone_with_commits_of_its_own_is_left_alone(repos):
+    dev, user, mark = repos
+    push(dev, "v2\n", "two")
+    (user / "mine.txt").write_text("x")
+    git(user, "add", ".")
+    git(user, "commit", "-q", "-m", "mine")
+    with pytest.raises(RuntimeError, match="commits of its own"):
+        update.run(say=lambda t: None)
+    assert not mark.exists() and (user / "README.md").read_text() == "v1\n"
+
+
+def test_no_network_says_so(repos):
+    dev, user, mark = repos
+    git(user, "remote", "set-url", "origin", str(user / "nowhere.git"))
+    with pytest.raises(RuntimeError, match="couldn't check for updates.*online"):
+        update.run(say=lambda t: None)
+
+
+def test_a_copy_not_installed_from_a_clone_gets_one(repos, tmp_path, monkeypatch):
+    # a zip download or a plain pip install has no clone to pull: binharic keeps its own
+    dev, user, mark = repos
+    push(dev, "v2\n", "two")
+    own = tmp_path / "data" / "src"
+    monkeypatch.setattr(update, "source_dir", lambda: None)
+    monkeypatch.setattr(update, "managed_dir", lambda: own)
+    monkeypatch.setattr(update, "REPO_URL", git(user, "remote", "get-url", "origin"))
+    out = []
+    assert update.run(force=True, say=out.append) == 0
+    assert (own / "README.md").read_text() == "v2\n" and mark.read_text() == "1 v2\n"
+    push(dev, "v3\n", "three")
+    assert update.run(say=out.append) == 0  # and from then on it updates like any other
+    assert (own / "README.md").read_text() == "v3\n"
+
+
+def test_version_is_shown(tmp_path, monkeypatch, capsys):
+    from binharic import cli
+    (tmp_path / "binharic-commit").write_text("0123456789abcdef\n")
+    monkeypatch.setattr(update.sys, "prefix", str(tmp_path))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--version"])
+    assert e.value.code == 0
+    assert capsys.readouterr().out.strip() == f"binharic {update.version()} (0123456)"

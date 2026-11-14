@@ -1,13 +1,20 @@
-"""Framing and encryption of text into bytes.
+"""Framing, error correction and encryption of text into bytes.
 
-Frame layout (all big-endian):
+Frame layout (version 2, all big-endian):
 
-    flags      1 byte   0xB0 | mode_id << 1 | encrypted
+    header     2 bytes  flags (0xC0 | mode_id << 1 | encrypted), payload length
+    header rs  4 bytes  Reed-Solomon parity: the header survives 2 wrong bytes
     [nonce]    6 bytes  only when encrypted: random, never reused in practice
     [tag]      6 bytes  only when encrypted: authentication tag
-    length     2 bytes  payload length
-    payload    N bytes  UTF-8 text (encrypted when the flag is set)
-    crc        2 bytes  CRC-16/CCITT over everything above (catches noise)
+    payload    N bytes  UTF-8 text (encrypted when the flag is set), N <= 186
+    crc        2 bytes  CRC-16/CCITT over the header and everything since
+    body rs    P bytes  Reed-Solomon parity over nonce..crc: about a quarter
+                        more sound, and one wrong byte in eight is repaired
+
+A voice call loses packets and stretches or squeezes the sound to keep up;
+each of those turns a tone or two into the wrong one. Version 1 frames (flags
+0xB0, a 2-byte length, no parity) died of a single wrong tone. They are still
+read, so a friend who hasn't updated yet can be understood, but never sent.
 
 Encryption is encrypt-then-MAC with standard building blocks:
 
@@ -32,10 +39,14 @@ import hmac
 import os
 from dataclasses import dataclass
 
-MAGIC = 0xB0
-MAX_PAYLOAD = 1024
+MAGIC = 0xC0
+MAGIC_V1 = 0xB0     # frames from before error correction: read, never sent
+MAX_PAYLOAD = 186   # so that nonce + tag + payload + crc + parity fit one Reed-Solomon block (255)
+MAX_PAYLOAD_V1 = 1024
 NONCE_LEN = 6
 TAG_LEN = 6
+HEADER_PARITY = 4
+HEADER_LEN = 2 + HEADER_PARITY
 KDF_SALT = b"binharic-v2 kdf"
 
 
@@ -58,11 +69,158 @@ class Message:
     encrypted: bool
     locked: bool = False  # encrypted and we have no (or the wrong) key
     raw: bytes = b""
+    repaired: int = 0     # bytes that arrived wrong and were put right
 
     def display(self) -> str:
         if self.locked:
             return f"[encrypted, {len(self.raw)} bytes: {self.raw.hex(' ')}]"
         return self.text or ""
+
+
+# --------------------------------------------------------------------------
+# Reed-Solomon over GF(256) (polynomial 0x11D, generator 2, first root 2^0).
+# A codeword is data + parity; position i stands for x^(n-1-i).
+
+_EXP = [0] * 510
+_LOG = [0] * 256
+_x = 1
+for _i in range(255):
+    _EXP[_i] = _x
+    _LOG[_x] = _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+for _i in range(255, 510):
+    _EXP[_i] = _EXP[_i - 255]
+
+
+class Uncorrectable(Exception):
+    pass
+
+
+def _mul(a: int, b: int) -> int:
+    return _EXP[_LOG[a] + _LOG[b]] if a and b else 0
+
+
+def _div(a: int, b: int) -> int:
+    return _EXP[(_LOG[a] - _LOG[b]) % 255] if a else 0
+
+
+def _poly_mul(p: list[int], q: list[int]) -> list[int]:
+    """Coefficients lowest power first."""
+    out = [0] * (len(p) + len(q) - 1)
+    for i, a in enumerate(p):
+        if a:
+            for j, b in enumerate(q):
+                out[i + j] ^= _mul(a, b)
+    return out
+
+
+def _poly_eval(p: list[int], x: int) -> int:
+    y = 0
+    for c in reversed(p):
+        y = _mul(y, x) ^ c
+    return y
+
+
+@functools.lru_cache(maxsize=None)
+def _generator(nsym: int) -> tuple[int, ...]:
+    g = [1]
+    for i in range(nsym):
+        g = _poly_mul(g, [_EXP[i], 1])
+    return tuple(reversed(g))  # highest power first, monic
+
+
+def rs_parity(data: bytes, nsym: int) -> bytes:
+    if len(data) + nsym > 255:
+        raise ValueError("Reed-Solomon block longer than 255 bytes")
+    gen = _generator(nsym)
+    rem = [0] * nsym
+    for byte in data:
+        f = byte ^ rem[0]
+        rem = rem[1:] + [0]
+        if f:
+            for i in range(nsym):
+                rem[i] ^= _mul(gen[i + 1], f)
+    return bytes(rem)
+
+
+def _syndromes(block, nsym: int) -> list[int]:
+    out = []
+    for j in range(nsym):
+        x, y = _EXP[j], 0
+        for c in block:
+            y = _mul(y, x) ^ c
+        out.append(y)
+    return out
+
+
+def rs_correct(block: bytes, nsym: int, erasures: tuple[int, ...] | list[int] = ()) -> tuple[bytes, int]:
+    """Repair a codeword (data + ``nsym`` parity bytes). ``erasures`` are positions
+    known to be unreliable. Repairs e wrong bytes and f erasures when 2e + f <= nsym.
+
+    Returns (data, bytes changed). Raises Uncorrectable.
+    """
+    n = len(block)
+    if n > 255 or n <= nsym:
+        raise Uncorrectable("bad block length")
+    synd = _syndromes(block, nsym)
+    if not any(synd):
+        return bytes(block[:n - nsym]), 0
+    erasures = sorted(set(e for e in erasures if 0 <= e < n))
+    if len(erasures) > nsym:
+        raise Uncorrectable("too many erasures")
+    # erasure locator: a root at X^-1 for every erased position X = 2^(n-1-i)
+    gamma = [1]
+    for e in erasures:
+        gamma = _poly_mul(gamma, [1, _EXP[n - 1 - e]])
+    # what the erasures can't explain is left for unknown errors (Berlekamp-Massey)
+    forney = _poly_mul(synd, gamma)[len(erasures):nsym]
+    lam, prev, length, shift, last = [1], [1], 0, 1, 1
+    for k, s in enumerate(forney):
+        d = s
+        for i in range(1, length + 1):
+            if i < len(lam):
+                d ^= _mul(lam[i], forney[k - i])
+        if d == 0:
+            shift += 1
+            continue
+        coef = _div(d, last)
+        new = lam + [0] * (len(prev) + shift - len(lam))
+        for i, c in enumerate(prev):
+            new[i + shift] ^= _mul(coef, c)
+        if 2 * length <= k:
+            prev, last, length, shift = lam, d, k + 1 - length, 1
+        else:
+            shift += 1
+        lam = new
+    lam = lam[:length + 1]
+    if 2 * length + len(erasures) > nsym:
+        raise Uncorrectable("too many errors")
+    psi = _poly_mul(lam, gamma)
+    while len(psi) > 1 and psi[-1] == 0:
+        psi.pop()
+    where = [i for i in range(n) if _poly_eval(psi, _EXP[(255 - (n - 1 - i)) % 255]) == 0]
+    if len(where) != len(psi) - 1:
+        raise Uncorrectable("error positions don't add up")
+    omega = _poly_mul(synd, psi)[:nsym]
+    deriv = [psi[i] if i % 2 else 0 for i in range(1, len(psi))]  # formal derivative (characteristic 2)
+    fixed = bytearray(block)
+    for i in where:
+        x = _EXP[n - 1 - i]
+        x_inv = _EXP[(255 - (n - 1 - i)) % 255]
+        den = _poly_eval(deriv, x_inv)
+        if den == 0:
+            raise Uncorrectable("can't size an error")
+        fixed[i] ^= _mul(x, _div(_poly_eval(omega, x_inv), den))
+    if any(_syndromes(fixed, nsym)):
+        raise Uncorrectable("repair didn't hold")
+    return bytes(fixed[:n - nsym]), sum(a != b for a, b in zip(fixed, block))
+
+
+def parity_len(body: int) -> int:
+    """Parity bytes for ``body`` data bytes: 4, plus 2 for every 8 (one wrong byte in 8 is repaired)."""
+    return 4 + 2 * -(-body // 8)
 
 
 @functools.lru_cache(maxsize=16)
@@ -92,44 +250,153 @@ def _xor(data: bytes, stream: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, stream))
 
 
-def _finish(head: bytes, payload: bytes) -> bytes:
-    body = head + payload
-    return body + binascii.crc_hqx(body, 0xFFFF).to_bytes(2, "big")
+def _crc(data: bytes) -> bytes:
+    return binascii.crc_hqx(data, 0xFFFF).to_bytes(2, "big")
 
 
-def build_frame(text: str, mode_id: int, key: str | None = None, nonce: bytes | None = None) -> bytes:
+def _assemble(flags: int, body: bytes, length: int) -> bytes:
+    """header + its parity + body (nonce, tag, payload) + crc + the body's parity"""
+    head = bytes([flags, length])
+    body += _crc(head + body)
+    return head + rs_parity(head, HEADER_PARITY) + body + rs_parity(body, parity_len(len(body)))
+
+
+def build_frame(text: str, mode_id: int, key: str | None = None, nonce: bytes | None = None,
+                version: int = 2) -> bytes:
+    if version == 1:
+        return _build_frame_v1(text, mode_id, key, nonce)
     payload = text.encode("utf-8")[:MAX_PAYLOAD]
-    flags = bytes([MAGIC | (mode_id << 1) | int(bool(key))])
-    length = len(payload).to_bytes(2, "big")
+    flags = MAGIC | (mode_id << 1) | int(bool(key))
     if not key:
-        return _finish(flags + length, payload)
+        return _assemble(flags, payload, len(payload))
     enc_key, mac_key = _keys(key)
     nonce = nonce if nonce is not None else os.urandom(NONCE_LEN)
     ct = _xor(payload, _keystream(enc_key, nonce, len(payload)))
-    tag = _tag(mac_key, flags + nonce + length, ct)
-    return _finish(flags + nonce + tag + length, ct)
+    tag = _tag(mac_key, bytes([flags]) + nonce + bytes([len(payload)]), ct)
+    return _assemble(flags, nonce + tag + ct, len(payload))
 
 
 def build_decoy(mode_id: int, length: int) -> bytes:
-    """A frame that looks exactly like an encrypted message (valid magic,
-    nonce, tag field, length and CRC) but carries random bytes. Without the
-    key it can't be told apart from a real one; with the key its tag fails,
-    so the receiver drops it."""
-    flags = bytes([MAGIC | (mode_id << 1) | 1])
-    return _finish(flags + os.urandom(NONCE_LEN + TAG_LEN) + length.to_bytes(2, "big"), os.urandom(length))
+    """A frame that looks exactly like an encrypted message (valid header,
+    nonce, tag field, length, checksum and parity) but carries random bytes.
+    Without the key it can't be told apart from a real one; with the key its
+    tag fails, so the receiver drops it."""
+    length = max(0, min(length, MAX_PAYLOAD))
+    return _assemble(MAGIC | (mode_id << 1) | 1, os.urandom(NONCE_LEN + TAG_LEN + length), length)
 
 
-def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None) -> tuple[Message, int]:
+def frame_length(payload: int, encrypted: bool) -> int:
+    """Bytes on the air for a payload of ``payload`` bytes."""
+    body = (NONCE_LEN + TAG_LEN if encrypted else 0) + payload + 2
+    return HEADER_LEN + body + parity_len(body)
+
+
+def _header(data: bytes) -> tuple[int, int] | None:
+    """(flags, length) if ``data`` starts with a version 2 header, repaired if need be."""
+    try:
+        head, _ = rs_correct(data[:HEADER_LEN], HEADER_PARITY)
+    except Uncorrectable:
+        return None
+    if head[0] & 0xF0 != MAGIC or head[1] > MAX_PAYLOAD:
+        return None
+    return head[0], head[1]
+
+
+def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None,
+                doubt: list[float] | None = None) -> tuple[Message, int]:
     """Parse a frame from the start of ``data``.
+
+    ``doubt``, one number per byte, says how unsure the receiver was of each
+    (higher = less sure): when plain repair fails, the most doubtful bytes are
+    treated as missing, which repairs up to twice as many.
 
     Returns (message, bytes_consumed). Raises NeedMore if ``data`` is a
     truncated but plausible frame and BadFrame if it cannot be one.
     """
     if not data:
         raise NeedMore(1)
-    flags = data[0]
-    if flags & 0xF0 != MAGIC:
+    old = data[0] & 0xF0 == MAGIC_V1
+    if len(data) < HEADER_LEN:
+        if old:
+            return _parse_frame_v1(data, key, mode_id)  # asks for what it needs
+        raise NeedMore(HEADER_LEN)
+    head = _header(data)
+    if head is None:
+        if old:
+            return _parse_frame_v1(data, key, mode_id)
         raise BadFrame("bad magic")
+    flags, length = head
+    frame_mode = (flags >> 1) & 0x07
+    if mode_id is not None and frame_mode != mode_id:
+        raise BadFrame("mode mismatch")
+    encrypted = bool(flags & 1)
+    extra = NONCE_LEN + TAG_LEN if encrypted else 0
+    body_len = extra + length + 2
+    nsym = parity_len(body_len)
+    total = HEADER_LEN + body_len + nsym
+    if len(data) < total:
+        raise NeedMore(total)
+    block = data[HEADER_LEN:total]
+    head_bytes = bytes([flags, length])
+    repaired = sum(a != b for a, b in zip(head_bytes + rs_parity(head_bytes, HEADER_PARITY), data[:HEADER_LEN]))
+
+    def attempt(erasures=()):
+        try:
+            body, fixed = rs_correct(block, nsym, erasures)
+        except Uncorrectable:
+            return None
+        if _crc(head_bytes + body[:-2]) != body[-2:]:
+            return None  # "repaired" into a different valid block: too damaged
+        return body[:-2], fixed
+
+    got = attempt()
+    if got is None and doubt is not None and len(doubt) >= total:
+        # the least certain bytes first; try treating more and more of them as missing
+        order = sorted(range(len(block)), key=lambda i: -doubt[HEADER_LEN + i])
+        for count in sorted({nsym // 4, nsym // 2, 3 * nsym // 4, nsym - 2} - {0}):
+            got = attempt(order[:count])
+            if got is not None:
+                break
+    if got is None:
+        raise BadFrame("crc mismatch")
+    body, fixed = got
+    repaired += fixed
+    payload = body[extra:]
+    if encrypted:
+        if not key:
+            return Message(None, frame_mode, True, locked=True, raw=payload, repaired=repaired), total
+        enc_key, mac_key = _keys(key)
+        nonce, tag = body[:NONCE_LEN], body[NONCE_LEN:extra]
+        if not hmac.compare_digest(tag, _tag(mac_key, bytes([flags]) + nonce + bytes([length]), payload)):
+            # wrong key, a decoy, or tampered with: never show it as text
+            return Message(None, frame_mode, True, locked=True, raw=payload, repaired=repaired), total
+        payload = _xor(payload, _keystream(enc_key, nonce, len(payload)))
+    return Message(payload.decode("utf-8", errors="replace"), frame_mode, encrypted, raw=payload,
+                   repaired=repaired), total
+
+
+# -- version 1 (no error correction): read for friends who haven't updated ----
+
+def _finish_v1(head: bytes, payload: bytes) -> bytes:
+    body = head + payload
+    return body + _crc(body)
+
+
+def _build_frame_v1(text: str, mode_id: int, key: str | None = None, nonce: bytes | None = None) -> bytes:
+    payload = text.encode("utf-8")[:MAX_PAYLOAD_V1]
+    flags = bytes([MAGIC_V1 | (mode_id << 1) | int(bool(key))])
+    length = len(payload).to_bytes(2, "big")
+    if not key:
+        return _finish_v1(flags + length, payload)
+    enc_key, mac_key = _keys(key)
+    nonce = nonce if nonce is not None else os.urandom(NONCE_LEN)
+    ct = _xor(payload, _keystream(enc_key, nonce, len(payload)))
+    tag = _tag(mac_key, flags + nonce + length, ct)
+    return _finish_v1(flags + nonce + tag + length, ct)
+
+
+def _parse_frame_v1(data: bytes, key: str | None = None, mode_id: int | None = None) -> tuple[Message, int]:
+    flags = data[0]
     frame_mode = (flags >> 1) & 0x07
     if mode_id is not None and frame_mode != mode_id:
         raise BadFrame("mode mismatch")
@@ -146,13 +413,13 @@ def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None)
         raise NeedMore(pos + 2)
     length = int.from_bytes(data[pos:pos + 2], "big")
     pos += 2
-    if length > MAX_PAYLOAD:
+    if length > MAX_PAYLOAD_V1:
         raise BadFrame("length out of range")
     total = pos + length + 2
     if len(data) < total:
         raise NeedMore(total)
     body = data[:pos + length]
-    if binascii.crc_hqx(body, 0xFFFF) != int.from_bytes(data[pos + length:total], "big"):
+    if _crc(body) != data[pos + length:total]:
         raise BadFrame("crc mismatch")
     payload = data[pos:pos + length]
 
@@ -162,13 +429,12 @@ def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None)
         enc_key, mac_key = _keys(key)
         header = data[:1] + nonce + data[pos - 2:pos]
         if not hmac.compare_digest(tag, _tag(mac_key, header, payload)):
-            # wrong key, a decoy, or tampered with: never show it as text
             return Message(None, frame_mode, True, locked=True, raw=payload), total
         payload = _xor(payload, _keystream(enc_key, nonce, len(payload)))
     return Message(payload.decode("utf-8", errors="replace"), frame_mode, encrypted, raw=payload), total
 
 
-CHUNK_BYTES = 240  # per frame: each frame has its own sync chirp, so long text re-syncs often
+CHUNK_BYTES = 160  # per frame: each frame has its own sync chirp, so long text re-syncs often
 
 
 def split_text(text: str, max_bytes: int = CHUNK_BYTES) -> list[str]:

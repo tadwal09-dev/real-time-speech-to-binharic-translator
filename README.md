@@ -39,15 +39,27 @@ Nothing you say is sent to the cloud. `./install.sh --uninstall` removes it.
 From any folder:
 
 ```sh
-binharic update                        # pull the newest version and reinstall it
+binharic update                        # check for a newer version and install it
 binharic update --check                # only show what's new
+binharic update --force                # reinstall even when nothing is new
 binharic update --branch experimental  # follow the experimental branch from now on
 binharic update --branch main          # back to the stable one
+binharic --version                     # which version (and commit) is installed
 ```
 
-It updates the clone you installed from (it remembers where) and runs its installer again,
-without the "talk to test your mic" step. `main` only gets changes after they passed every
-test three times; `experimental` gets them first. Restart a running binharic afterwards.
+It fetches the clone you installed from (it remembers where), shows what's new, and runs
+the installer in a quick mode: only binharic itself is reinstalled (the speech and GPU
+libraries stay exactly as they were), there's no "talk to test your mic" step, and it asks
+for your password only if a system package is actually missing. If the background service
+is running, it's restarted on the new version; a binharic you started yourself has to be
+closed and started again. A copy that wasn't installed from a git clone gets a clone of its
+own (in binharic's data folder) the first time. `main` only gets changes after they passed
+every test three times; `experimental` gets them first.
+
+**Both sides need 0.5 or newer to read each other.** 0.5 added error correction to the
+screech (see [Sound modes](#sound-modes)). It still reads screeches from older copies, but
+older copies can't read its screeches, so tell your friends to update too. Older copies have
+no `binharic update` yet: there it's `git pull` and `./install.sh` (or `install.ps1`) once.
 
 ## Something not working? `binharic fix`
 
@@ -260,12 +272,31 @@ rewriting them in C++ wouldn't make it feel any faster. A GPU, or a faster CPU, 
 | `hex` | Clean 16-tone R2-D2 beeping | One pure tone per hex digit |
 | `binary` | Literal ones and zeros | A low beep for 0 and a high beep for 1, 8 per letter (slowest) |
 
-Every message starts with a rising sync chirp and ends with a checksum, so garbled
-audio is dropped rather than decoded wrong. Long text goes out as several messages, each
-with its own chirp. The decoder follows small differences in speed between the two
-computers' sound cards (it decodes fine with the sender's clock 0.3% fast or slow, about
-30 times more than real sound cards differ). `--speed` changes the tempo (0.25–4×), and
-listeners must use the same speed.
+Every message starts with a rising sync chirp, and long text goes out as several messages
+(160 bytes each at most), each with its own chirp. `--speed` changes the tempo (0.25–4×),
+and listeners must use the same speed.
+
+### Getting through a voice call
+
+A call is rough on a screech. Packets get lost and the receiver papers over each with a
+guess, and the receiver's jitter buffer cuts out or repeats a few milliseconds several
+times a second to keep up. Either one turns a tone into the wrong one. So:
+
+* **Every message carries error correction** (Reed-Solomon): about a quarter more sound,
+  and roughly one damaged byte in eight is repaired; the header is protected separately. A
+  checksum still catches whatever is beyond repair, so a message is read right or not at
+  all, never wrong.
+* **The decoder follows the timing** instead of assuming it: slow drift between two sound
+  cards (0.3% is fine, about 30 times more than real cards differ) and sudden jumps when the
+  call cuts or repeats sound.
+* `binharic decode` shows how rough the way was, e.g. `(Discord, 3 damaged bytes repaired)`.
+
+In a simulated call with 3% of the packets lost and the sound cut or stretched once a
+second, a 60-letter message used to arrive less than half the time; now it arrives about
+19 times in 20 in `binharic` and `hex` mode. **`binary` mode is the exception**: it's eight
+beeps a letter and each beep is barely longer than what a call cuts out, so over a call it
+only works for a few words on a good connection. Use it for fun, for files, or on the same
+PC; use `binharic` or `hex` to actually talk.
 
 ## Privacy: unencrypted, encrypted, or encrypted + gibberish
 
@@ -275,7 +306,7 @@ the TUI, or `binharic privacy …` while it runs:
 | Option | Who can read you | Cost |
 |---|---|---|
 | `plain` (**Unencrypted**) | anyone running `binharic decode` | none |
-| `encrypted` | only people with your key; anyone else gets `[encrypted, N bytes …]` | +12 bytes per message (about 0.6 s of screech in binharic mode) |
+| `encrypted` | only people with your key; anyone else gets `[encrypted, N bytes …]` | +16 bytes per message (about 0.8 s of screech in binharic mode) |
 | `decoys` (**Encrypted + gibberish**) | only key holders, and nobody else can tell which chirp is real or how long it is | each decoy adds about a message's length of screech |
 
 ```sh
@@ -317,8 +348,9 @@ binharic gui --hear speakers              # see incoming messages decoded inside
 A friend's screech in Discord plays in your headphones, where your mic can't hear it, so
 `decode` listens to what your PC plays too: the mix your speakers get, and every app on its
 own. On its own, Discord's screech decodes even while music or a game plays over it, and each
-message says which app it came from. If a screech arrives but can't be read, `decode` says
-so: usually the sender's voice app has noise suppression on.
+message says which app it came from, and how many damaged bytes had to be repaired. If a
+screech arrives but can't be read at all, `decode` says so: the sender is on an older
+version, their voice app has noise suppression on, or the connection is very bad.
 
 ## Other commands
 
@@ -330,6 +362,7 @@ binharic text -r "01001000 01101001"      # back to text
 binharic mic up | down | status           # manage the Binharic Mic
 binharic devices                          # list inputs/outputs, and which ones binharic uses
 binharic doctor                           # check the install
+binharic update                           # check for a newer version and install it
 binharic download-model medium.en         # fetch another Whisper model
 ```
 

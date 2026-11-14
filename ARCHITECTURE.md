@@ -57,7 +57,7 @@ is written. While OFF, the output is silent, or your voice with
 | `binharic/gpu.py` | Loads CUDA 12 cuBLAS/cuDNN from pip wheels for Whisper |
 | `binharic/ish.py` | iSH mode: text (dictation) → WAV files in `~/binharic`, m4a input via ffmpeg |
 | `binharic/incoming.py` | `Incoming`: decodes several inputs at once (mic, the speakers' mix, each app's own playback stream), merges and dedupes; used by `decode` and `--hear` on PipeWire/Pulse |
-| `binharic/update.py` | `binharic update`: finds the clone binharic was installed from (`direct_url.json`), fetches, fast-forwards or switches branch, reruns the installer with `BINHARIC_UPDATE=1` |
+| `binharic/update.py` | `binharic update` and `--version`: finds the clone binharic was installed from (`direct_url.json`; else it makes one in the data folder), fetches, fast-forwards or switches branch, reruns the installer in its quick mode (`BINHARIC_UPDATE=1`), restarts the background service |
 | `binharic/ui_cli.py` | `listen`: the plain log (`Printer` turns events into lines) |
 | `binharic/ui_tui.py` | `tui`: curses dashboard (`Dashboard`) |
 | `binharic/ui_gui.py` | `gui`: Tk window (`run`) |
@@ -79,7 +79,7 @@ is written. While OFF, the output is silent, or your voice with
 | `privacy LEVEL`, `send WHEN` | Change a running layer's privacy, or when it screeches | `_control` |
 | `say TEXT` | Screech typed text: into the running layer if there is one, else straight into the Binharic Mic (or the speakers), or `--wav FILE` | `cmd_say` |
 | `decode` | Turn binharic back into text: by default the mic plus what the PC plays (the mix and every app on its own); or `--source speakers`, a source/device, or a WAV | `cmd_decode`, `_decode_incoming` |
-| `update [--check] [--branch B]` | Update from any folder: pull the install clone and reinstall; switch between `main` and `experimental` | `cmd_update` → `update.run` |
+| `update [--check] [--force] [--branch B]`, `--version` | Check for a newer version and install it, from any folder; switch between `main` and `experimental`; show the installed version and commit | `cmd_update` → `update.run`, `update.describe` |
 | `text` | Show text as binary/hex, or `--reverse` to read it back | `cmd_text` |
 | `mic up/down/status` | Create or remove the Binharic Mic (Linux); explains VB-Cable on Windows | `cmd_mic` |
 | `devices` | List sinks, sources and PortAudio devices | `cmd_devices` |
@@ -183,10 +183,23 @@ interrupt `accept()` on Windows.
   symbol). `--speed` scales the symbol time, and both sides must use the
   same speed.
 * `find_preambles` uses FFT normalised cross-correlation against the chirp.
-* `_Demod` reads symbols with an early/late gate that follows clock drift
-  between sound cards.
+* `_Demod` reads a frame's symbols without trusting the time grid. It measures every
+  tone's strength every millisecond (`_strengths`: a Hann window one symbol long, all
+  tones in one matrix product) and finds the best path through them with Viterbi
+  (`read`): one position per symbol, each a symbol's length after the one before, give or
+  take a slip of up to 20 ms that costs `SLIP_COST` per symbol's length slipped. That
+  follows clock drift, and the jumps a call's jitter buffer makes when it cuts out or
+  repeats a few ms. `read` also returns a doubt per symbol (how close the runner-up tone
+  was), which the frame's error correction uses.
+  * The cost is per *symbol's length*, not per ms, and the first symbol's offset from the
+    chirp costs the same. Both matter: everything read one whole symbol early or late
+    scores almost as well as the truth, and only that cost tells them apart (binary mode
+    with an echo locked on a beep early before this).
 * `decode_audio(sig, sr, mode, key, speed)` decodes a whole recording.
-  `try_decode_at` raises `NeedMore` (not all here yet) or `BadFrame`.
+  `try_decode_at(..., final)` raises `NeedMore` (not all here yet) or `BadFrame`. It
+  reads the 6 header bytes first, then the whole frame once `SLACK` (60 ms) more than its
+  nominal length has arrived, and asks for more if the path shows the call stretched it
+  further. `final=True` (a recording, or `flush()`) reads what there is.
 * `StreamDecoder.feed(block)` decodes live audio. It keeps candidate chirp
   positions, and a cut-off frame never blocks the next one. **It must
   never trim audio it hasn't searched yet**: that bug lost whole messages
@@ -215,12 +228,26 @@ interrupt `accept()` on Windows.
   `Incoming` reports it only if no other input read that screech.
 * Our own streams (`application.name` binharic) are never tapped.
 
-## 6. Frames and encryption: `codec.py`
+## 6. Frames, error correction and encryption: `codec.py`
 
 ```
-flags 1 (0xB0 | mode_id<<1 | encrypted) · [nonce 6 · tag 6] · length 2 · payload · CRC-16 2
+flags 1 (0xC0 | mode_id<<1 | encrypted) · length 1 · header parity 4
+· [nonce 6 · tag 6] · payload (≤186) · CRC-16 2 · body parity (4 + 2 per 8 body bytes)
 ```
 
+* **Reed-Solomon** over GF(256) (`rs_parity`, `rs_correct`; polynomial 0x11D, pure
+  Python, checked against the `reedsolo` package when it was written). The header is its
+  own little codeword (2 of its 6 bytes may be wrong): without the length nothing else
+  can be found. The body (nonce, tag, payload, CRC) is one block of at most 255 bytes;
+  that is where `MAX_PAYLOAD` = 186 and `CHUNK_BYTES` = 160 come from.
+* `parse_frame(data, key, mode_id, doubt)` repairs, then checks the CRC (over header +
+  body). A "repair" into a different valid block is caught there. If plain repair fails
+  and the modem said how doubtful each byte was, it retries treating the most doubtful
+  bytes as missing (erasures cost half as much parity). `Message.repaired` counts the
+  bytes put right; `decode` shows it.
+* **Version 1 frames** (flags `0xB0`, 2-byte length, no parity; what 0.4 and older send)
+  are still parsed (`_parse_frame_v1`) and can be built for tests
+  (`build_frame(..., version=1)`). They are never sent. Old copies can't read version 2.
 * The key comes from scrypt(N=2^14, r=8, p=1, a fixed salt) and is split
   into an encryption key and a MAC key. `_keys` is `lru_cache`d, so it's
   about 0.1 s once per passphrase.
@@ -228,14 +255,16 @@ flags 1 (0xB0 | mode_id<<1 | encrypted) · [nonce 6 · tag 6] · length 2 · pay
   stream. The tag is HMAC-SHA256(mac_key, flags + nonce + length +
   ciphertext)[:6], checked with `hmac.compare_digest`.
 * A wrong key or a tampered frame comes back as `Message(locked=True)`.
-  The UI shows `[encrypted, N bytes …]`, never garbage.
+  The UI shows `[encrypted, N bytes …]`, never garbage. Error correction changes
+  nothing here: an attacker can always redo checksum and parity, the tag is what stops them
+  (`test_any_tampering_is_rejected`).
 * `build_decoy` makes a frame with a valid structure and random contents.
   The tag check fails for everyone, so key holders drop it.
-* `split_text` cuts text into frames of 240 UTF-8 bytes at most, at
+* `split_text` cuts text into frames of 160 UTF-8 bytes at most, at
   spaces (each frame re-syncs).
 * Changing the frame format or the KDF breaks compatibility with copies
-  already in use. If you have to, bump `KDF_SALT` (`binharic-v2 kdf`) or
-  the magic number, and say so in the README.
+  already in use. If you have to: new magic nibble, keep parsing the old one, bump
+  `KDF_SALT` (`binharic-v2 kdf`) if the cipher changes, and say so in the README.
 
 ## 7. Speech: `stt.py` and `vad.py`
 
@@ -451,3 +480,20 @@ Push to the working branch; CI runs everything on all four platforms.
   earbuds' mic and never the screech. The `guard` thread moves such streams back.
 * A test helper process that isn't cleaned up keeps running for hours:
   every `Layer` registers itself with `ctx`, which kills it.
+* **The updater** (`update.py`): the installers write the commit they installed to
+  `<venv>/binharic-commit`. `update.run` compares it with the clone, so an update that was
+  pulled but never installed is finished instead of reported as "up to date". The
+  installers' quick mode (`BINHARIC_UPDATE=1` / `-Update`) must stay quick and safe: no
+  sudo unless a package is really missing (`pacman -T`), `--reinstall-package binharic`
+  and no `--upgrade` (a newer speech library could want other CUDA libraries than the ones
+  `fix` installed), no `fix`. CI runs it with a `sudo` that fails (`.github/scripts/no-sudo`).
+* uv doesn't rebuild a local folder whose `pyproject.toml` is unchanged, and setuptools
+  copies a stale `build/` folder into the package: the installers pass
+  `--reinstall-package binharic` and delete `build/` first.
+* Mic blocks are dropped oldest-first when recognition falls behind. Making room and
+  putting must tolerate the other thread getting in between (`queue.Empty`/`Full`), or the
+  mic thread dies and the layer stops with "mic failed".
+* Earbuds with a noise gate deliver exact zeros until you speak. Silence alone is not a
+  broken mic: the layer remarks on it once after 12 s (`SILENT_SECONDS`), as a warning.
+* `binharic say --direct` without the Binharic Mic plays on the *speakers* (`--sink auto`
+  falls back to them). When testing on a user's machine, pass `--sink binharic_out`.

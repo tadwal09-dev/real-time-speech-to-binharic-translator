@@ -1,6 +1,6 @@
 #!/bin/sh
 # iSH (iOS) installer. In iSH:
-#   apk add git && git clone -b claude/happy-gates-btt1f9 https://github.com/tadwal09-dev/real-time-speech-to-binharic-translator.git
+#   apk add git && git clone https://github.com/tadwal09-dev/real-time-speech-to-binharic-translator.git
 #   cd real-time-speech-to-binharic-translator && sh install-ish.sh
 #
 # iSH can't reach the iPhone's mic or speaker, so this version works with
@@ -8,21 +8,28 @@
 set -e
 cd "$(dirname "$0")"
 
-echo ":: packages (python, numpy from Alpine - compiling it in iSH would take hours)"
-apk add --no-cache python3 py3-numpy py3-pip
-echo ":: ffmpeg lets you decode Voice Memos recordings (m4a); skip with NO_FFMPEG=1"
-[ -n "$NO_FFMPEG" ] || apk add --no-cache ffmpeg || echo "!! ffmpeg didn't install; WAV files still work"
+if [ -z "$BINHARIC_UPDATE" ]; then  # `binharic update` skips what's already there
+  echo ":: packages (python, numpy from Alpine - compiling it in iSH would take hours)"
+  apk add --no-cache python3 py3-numpy py3-pip
+  echo ":: ffmpeg lets you decode Voice Memos recordings (m4a); skip with NO_FFMPEG=1"
+  [ -n "$NO_FFMPEG" ] || apk add --no-cache ffmpeg || echo "!! ffmpeg didn't install; WAV files still work"
+fi
 
 echo ":: installing binharic"
 python3 -m venv --system-site-packages "$HOME/.binharic-venv"
 # --no-deps: numpy comes from Alpine; the mic/speaker and speech parts can't work in iSH anyway
-"$HOME/.binharic-venv/bin/pip" install --quiet --no-deps .
+rm -rf build  # a stale build folder would put deleted files back into the package
+"$HOME/.binharic-venv/bin/pip" install --quiet --no-deps --force-reinstall .
+# which commit this is: `binharic update` compares it with the clone
+git rev-parse HEAD > "$HOME/.binharic-venv/binharic-commit" 2>/dev/null || rm -f "$HOME/.binharic-venv/binharic-commit"
 ln -sf "$HOME/.binharic-venv/bin/binharic" /usr/local/bin/binharic
 
-if [ -z "$BINHARIC_UPDATE" ]; then
-  echo ":: checking"
-  binharic fix --no-gpu || true
+if [ -n "$BINHARIC_UPDATE" ]; then
+  binharic --version
+  exit 0
 fi
+echo ":: checking"
+binharic fix --no-gpu || true
 
 cat <<'MSG'
 

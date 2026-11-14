@@ -53,22 +53,53 @@ def test_keeps_a_normal_default(tmp_path, monkeypatch):
     assert pulse.real_sink() == "alsa_output.pci.analog-stereo"
 
 
-def test_silent_mic_is_reported(monkeypatch, tmp_path):
+def test_silent_mic_is_remarked_on_but_not_called_broken(monkeypatch, tmp_path):
+    # earbuds with a noise gate send pure zeros until you speak: after 5 quiet seconds this
+    # used to be an error ("the microphone is silent"). Now it's a remark, and later
     from tests.test_pipeline import FakeIn, FakeOut, ScriptedEngine
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr(core, "Input", FakeIn(np.zeros(48000 * 30, np.float32)))  # muted mic: pure zeros
+    monkeypatch.setattr(core, "Input", FakeIn(np.zeros(48000 * 30, np.float32)))  # pure zeros
     monkeypatch.setattr(core, "Output", FakeOut())
     monkeypatch.setattr(core, "make_engine", lambda *a, **k: ScriptedEngine([], ""))
+    monkeypatch.setattr(core.Translator, "SILENT_SECONDS", 2.0)
     import time
     tr = core.Translator(core.Settings(control_socket=False))
     logs = []
     tr.subscribe(lambda kind, ev: kind == "log" and logs.append((ev.get("level"), ev["text"])))
     tr.start()
     deadline = time.time() + 12
-    while time.time() < deadline and not any("silent" in t for _, t in logs):
+    while time.time() < deadline and not any("nothing heard" in t for _, t in logs):
         time.sleep(0.1)
+    time.sleep(0.5)
     tr.stop()
-    assert any(level == "error" and "silent" in t for level, t in logs)
+    assert [level for level, t in logs if "nothing heard" in t] == ["warn"]  # once, and not an error
+
+
+def test_a_full_mic_queue_never_kills_the_mic_thread(monkeypatch):
+    # regression: when recognition fell far behind, the mic thread made room by taking the
+    # oldest block; if the recogniser emptied the queue at that moment, the mic thread died
+    # of queue.Empty and the whole layer stopped with "mic failed"
+    import queue
+
+    class Racy(queue.Queue):
+        def put_nowait(self, item):
+            raise queue.Full
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class OneBlock:
+        n = 0
+
+        def read(self):
+            self.n += 1
+            if self.n > 3:
+                raise EOFError
+            return np.zeros(960, np.float32)
+    tr = core.Translator(core.Settings(control_socket=False))
+    tr._mic, tr._mic_q = OneBlock(), Racy()
+    tr._mic_loop()  # must simply return
+    assert tr._mic.n == 4
 
 
 def test_mic_down_removes_the_source_before_the_sink(monkeypatch):

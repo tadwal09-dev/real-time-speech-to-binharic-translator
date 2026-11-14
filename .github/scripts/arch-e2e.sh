@@ -20,6 +20,16 @@ export BINHARIC_E2E_CMD=~/.local/bin/binharic
 export BINHARIC_E2E_RESTART="$PWD/.github/scripts/pipewire.sh restart"
 xvfb-run -a -s "-screen 0 1280x1024x24" "$VENV/bin/python" -m tests.e2e.run "$@"
 
+echo "::group::the installer's quick mode (what binharic update runs)"
+# no sudo at all (everything is there), binharic rebuilt from this folder, the commit recorded
+out=$(BINHARIC_UPDATE=1 PATH="$PWD/.github/scripts/no-sudo:$PATH" ./install.sh 2>&1) || { echo "$out"; exit 1; }
+echo "$out"
+commit=$(git rev-parse HEAD)
+test "$(cat "$VENV/binharic-commit")" = "$commit"
+~/.local/bin/binharic --version | grep -F "(${commit:0:7})"
+! grep -q "finding and fixing problems" <<<"$out"
+echo "::endgroup::"
+
 echo "::group::./install.sh --uninstall"
 ./install.sh --uninstall
 test ! -e ~/.local/bin/binharic && test ! -e /usr/local/bin/binharic && test ! -d "$VENV"

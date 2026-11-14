@@ -1,6 +1,7 @@
 # Windows installer. In PowerShell, from the repo folder:
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
+# `binharic update` runs it with -Update: only binharic itself is reinstalled, and `binharic fix` is skipped.
 param([switch]$Uninstall, [switch]$NoGpu, [switch]$Update)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -34,10 +35,20 @@ if (-not (Test-Path $Py)) { uv venv --python 3.12 $Venv }
 
 Step "installing binharic + Whisper speech recognition (a few hundred MB)"
 $env:UV_HTTP_TIMEOUT = "600"
-if (-not (Retry { uv pip install --python $Py --upgrade ".[all]" })) {
+# always rebuild binharic itself from this folder; an update (-Update) leaves every other
+# package alone, a fresh install upgrades them
+$Pip = @("pip", "install", "--python", $Py, "--reinstall-package", "binharic")
+if (-not $Update) { $Pip += "--upgrade" }
+Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+if (-not (Retry { uv @Pip ".[all]" })) {
   Write-Host "!! Whisper didn't install; installing the lighter Vosk engine instead"
-  uv pip install --python $Py --upgrade ".[vosk]"
+  uv @Pip ".[vosk]"
+  if ($LASTEXITCODE -ne 0) { Write-Host "!! installation failed (see the error above)"; exit 1 }
 }
+# which commit this is: `binharic update` compares it with the clone
+$Commit = (git rev-parse HEAD 2>$null)
+if ($LASTEXITCODE -eq 0 -and $Commit) { Set-Content -Encoding ascii (Join-Path $Venv "binharic-commit") $Commit }
+else { Remove-Item (Join-Path $Venv "binharic-commit") -ErrorAction SilentlyContinue }
 
 Step "command and Start-menu shortcut"
 New-Item -ItemType Directory -Force $Bin | Out-Null
@@ -59,6 +70,8 @@ if (-not $Update) {  # `binharic update`: the setup was already checked when it 
   Step "finding and fixing problems (it will ask you to talk)"
   if ($NoGpu) { & $Exe fix --no-gpu } else { & $Exe fix }
 }
+
+if ($Update) { & $Exe --version; Write-Host "`nUpdated. You can close this window."; Start-Sleep 4; exit 0 }
 
 Write-Host @"
 

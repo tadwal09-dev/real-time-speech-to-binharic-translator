@@ -7,6 +7,10 @@
 #
 #   ./install.sh               install / update
 #   ./install.sh --uninstall   remove it again (keeps downloaded models)
+#
+# `binharic update` runs this with BINHARIC_UPDATE=1: the quick mode. It asks for
+# sudo only if something is really missing, upgrades nothing but binharic itself
+# (the speech and GPU libraries stay exactly as they were), and skips `binharic fix`.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -34,9 +38,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-if [[ -z "${BINHARIC_SKIP_PACMAN:-}" ]]; then
-  step "system packages: portaudio libpulse tk libnotify uv"
-  sudo pacman -S --needed --noconfirm portaudio libpulse tk libnotify uv \
+UPDATE=${BINHARIC_UPDATE:-}
+PACKAGES=(portaudio libpulse tk libnotify uv)
+# only what's missing, so nothing asks for a password when everything is there
+if [[ -z "${BINHARIC_SKIP_PACMAN:-}" ]] && command -v pacman >/dev/null && ! pacman -T "${PACKAGES[@]}" >/dev/null; then
+  step "system packages: ${PACKAGES[*]}"
+  sudo pacman -S --needed --noconfirm "${PACKAGES[@]}" \
     || fail "pacman failed - try 'sudo pacman -Syu' first, then run ./install.sh again"
 fi
 command -v uv >/dev/null || fail "uv is missing (sudo pacman -S uv)"
@@ -49,17 +56,31 @@ if [[ ! -x "$VENV/bin/python" ]] || ! "$VENV/bin/python" -c "import sys; sys.exi
   uv venv --python "$PY_VERSION" "$VENV" || fail "couldn't create the environment"
 fi
 
-step "installing binharic + Whisper speech recognition (first time: a few hundred MB)"
-if ! retry uv pip install --python "$VENV/bin/python" --upgrade '.[all]'; then
+# --reinstall-package: always rebuild binharic itself from this folder. An update leaves
+# every other package alone (a newer speech library could want other GPU libraries)
+PIP=(uv pip install --python "$VENV/bin/python" --reinstall-package binharic)
+[[ -n $UPDATE ]] || PIP+=(--upgrade)
+rm -rf build  # a stale build folder would put deleted files back into the package
+if [[ -n $UPDATE ]]; then step "installing the new binharic"; else
+  step "installing binharic + Whisper speech recognition (first time: a few hundred MB)"; fi
+if [[ -n $UPDATE ]] && ! "$VENV/bin/python" -c "import faster_whisper" 2>/dev/null; then
+  # this copy runs on Vosk (Whisper didn't install here): keep it that way
+  retry "${PIP[@]}" '.[vosk]' || fail "installation failed (see the error above)"
+  ENGINE=vosk
+elif ! retry "${PIP[@]}" '.[all]'; then
   echo "!! Whisper failed to install (see the error above); installing the lighter Vosk engine instead"
-  uv pip install --python "$VENV/bin/python" --upgrade '.[vosk]' || fail "installation failed (see the error above)"
+  "${PIP[@]}" '.[vosk]' || fail "installation failed (see the error above)"
   ENGINE=vosk
 else
   ENGINE=whisper
 fi
 ln -sf "$VENV/bin/binharic" "$BIN"
 "$BIN" --help >/dev/null || fail "binharic was installed but doesn't start"
-if command -v sudo >/dev/null && sudo ln -sf "$VENV/bin/binharic" "$GLOBAL"; then
+# which commit this is: `binharic update` compares it with the clone
+git rev-parse HEAD > "$VENV/binharic-commit" 2>/dev/null || rm -f "$VENV/binharic-commit"
+if [[ "$(readlink "$GLOBAL" 2>/dev/null)" == "$VENV/bin/binharic" ]]; then
+  GLOBAL_OK=1  # already there: no password needed
+elif command -v sudo >/dev/null && sudo ln -sf "$VENV/bin/binharic" "$GLOBAL"; then
   GLOBAL_OK=1
 else
   GLOBAL_OK=
@@ -73,7 +94,7 @@ install -m644 contrib/binharic.service ~/.config/systemd/user/binharic.service
 sed "s|^Exec=binharic |Exec=$BIN |" contrib/binharic.desktop > ~/.local/share/applications/binharic.desktop
 systemctl --user daemon-reload 2>/dev/null || true
 
-step "downloading speech models ($ENGINE)"
+step "speech models ($ENGINE)"
 if [[ $ENGINE == whisper ]]; then
   retry "$BIN" download-model --engine whisper || fail "model download failed (network?) - rerun ./install.sh"
 else
@@ -83,8 +104,9 @@ fi
 step "creating the Binharic Mic"
 "$BIN" mic up || echo "!! couldn't create it now - is PipeWire running? try later: binharic mic up"
 
-if [[ -n "${BINHARIC_UPDATE:-}" ]]; then
-  :  # `binharic update`: the setup was already checked when it was installed
+if [[ -n $UPDATE ]]; then
+  echo; "$BIN" --version
+  exit 0  # `binharic update`: the setup was already checked when it was installed
 else
   step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
   if [[ -n "${BINHARIC_NO_GPU:-}" ]]; then "$BIN" fix --no-gpu || true; else "$BIN" fix || true; fi

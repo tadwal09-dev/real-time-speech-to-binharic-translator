@@ -9,10 +9,11 @@ SR = 48000
 
 
 def garbled_screech(text: str) -> np.ndarray:
-    """A screech whose payload changed on the way (one byte), so its checksum fails."""
+    """A screech damaged on the way beyond repair (every other byte after the header)."""
     spec = modem.get_mode("binharic")
     frame = bytearray(codec.build_frame(text, spec.id))
-    frame[5] ^= 0x10
+    for i in range(codec.HEADER_LEN, len(frame), 2):
+        frame[i] ^= 0x10
     return modem.modulate(bytes(frame), spec, SR, 0.6)
 
 

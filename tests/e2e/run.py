@@ -339,12 +339,50 @@ def say_wav_three_privacy_levels(ctx):
 
 
 @case(ALL)
+def version_is_shown(ctx):
+    check(re.match(r"binharic \d+\.\d+", ctx.ok("--version").out.strip()), "binharic --version")
+    check("--check" in ctx.ok("update", "--help").out, "update --help")
+
+
+@case(ALL)
+def decode_survives_a_rough_call(ctx):
+    # regression: over a voice call (lost packets papered over, the jitter buffer cutting
+    # out and repeating a few ms), one wrong tone lost the whole message. Frames now carry
+    # error correction and the decoder follows timing slips
+    text = "the flesh is weak but the machine endures"
+    ms = SR // 1000
+    for mode in ("hex", "binharic"):
+        wav = str(ctx.tmp / f"call-{mode}.wav")
+        ctx.ok("say", "--wav", wav, "-m", mode, text)
+        x, _ = read_wav(wav)
+        x = np.concatenate([np.zeros(SR // 2, np.float32), x, np.zeros(SR // 2, np.float32)])
+        for at in range(int(0.9 * SR), len(x) - SR, int(0.45 * SR)):  # lost packets: the sound before, again
+            x[at:at + 20 * ms] = x[at - 20 * ms:at]
+        cut, rep = int(1.6 * SR), int(2.9 * SR)
+        x = np.concatenate([x[:cut], x[cut + 11 * ms:rep], x[rep - 13 * ms:rep], x[rep:]])
+        write_wav(wav, x, SR)
+        check(text in ctx.ok("decode", "--wav", wav).out, f"{mode}: read through the damage")
+
+
+@case(ALL)
+def screeches_from_older_versions_are_read(ctx):
+    # a friend who hasn't updated sends frames without error correction: still understood
+    from binharic import codec
+    wav = str(ctx.tmp / "old.wav")
+    for name, key in (("binharic", None), ("hex", "cant")):
+        spec = modem.get_mode(name)
+        old = codec.build_frame("from an old copy", spec.id, key, version=1)
+        write_wav(wav, modem.modulate(old, spec, SR, 0.6), SR)
+        check("from an old copy" in ctx.ok("decode", "--wav", wav, *(["-k", key] if key else [])).out, name)
+
+
+@case(ALL)
 def say_wav_unicode_long_and_piped(ctx):
     wav = str(ctx.tmp / "u.wav")
     msg = "héllo wörld ✓ 日本語 — praise"
     ctx.ok("say", "--wav", wav, msg)
     check(msg in ctx.ok("decode", "--wav", wav).out, "unicode round trip")
-    long = " ".join(f"word{i}" for i in range(80))  # > 240 bytes: several frames
+    long = " ".join(f"word{i}" for i in range(80))  # more than one frame holds: several frames
     ctx.ok("say", "--wav", wav, "-m", "hex", "--speed", "3", long)
     out = ctx.ok("decode", "--wav", wav, "--speed", "3").out
     check(norm(out).replace(" ", "") .find(norm(long).replace(" ", "")) >= 0, f"long text in chunks: {out[:300]}")

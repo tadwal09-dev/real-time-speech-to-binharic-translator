@@ -254,93 +254,163 @@ def find_preambles(sig: np.ndarray, sr: int, threshold: float = 0.45) -> list[in
 
 
 class _Demod:
-    """Reads symbols one after another, following the sender's clock.
+    """Reads the symbols of one frame, following the sender's timing.
 
-    Two sound cards never run at exactly the same rate, and over a long
-    message the difference adds up to more than the slack in each symbol.
-    After deciding each tone we compare its energy a little early and a
-    little late (an early/late gate) and nudge the timing towards the
-    stronger side, so the decoder tracks the drift instead of falling off it.
+    The receiver's clock is never the sender's. Sound cards drift apart, and
+    a voice call does worse: its jitter buffer cuts out or repeats a few
+    milliseconds of sound several times a second, and a lost packet is
+    papered over with a guess. So the tones are not looked for on a fixed
+    grid. The strength of every tone is measured every millisecond, and the best
+    path through those measurements is found (Viterbi): one position per
+    symbol, each a symbol's length after the one before, give or take a
+    slip that costs a little. A cut or a repeat then costs at most the tone
+    it landed on, and the error correction in the frame repairs that.
     """
 
-    GAIN = 0.5
+    HOP = 0.001         # seconds between measurements
+    SLIP_COST = 2.6     # for slipping a whole symbol's length, in units of a tone's usual strength:
+                        # high enough that reading everything one symbol early or late never pays
+    MAX_SLIP = 0.020    # seconds one symbol may slip against the one before
+    LEAD = 0.020        # seconds the first symbol may be off (a chirp found a little early or late); it
+                        # costs like any slip: the chirp is the only thing that says where symbol 0 is
 
     def __init__(self, sig: np.ndarray, sr: int, start: int, spec: ModeSpec):
         self.sig, self.sr, self.start, self.spec = sig, sr, start, spec
         self.n_sym = _steady(spec, sr)
-        self.margin = int(self.n_sym * 0.15)
-        self.win = self.n_sym - 2 * self.margin
-        self.window = np.hanning(self.win)
-        t = np.arange(self.win) / sr
-        self.basis = np.exp(-2j * np.pi * np.outer(np.asarray(spec.tones), t))  # (tones, win)
-        self.offset = 0.0  # samples: how far the sender's clock has drifted from ours
+        self.hop = max(1, int(round(self.HOP * sr)))
+        step = (spec.symbol + spec.guard) * sr
+        self.max_slip = max(1, int(min(self.MAX_SLIP * sr, 0.45 * step) / self.hop))
+        self.lead = max(1, int(min(self.LEAD * sr, 0.4 * step) / self.hop))
+        self.slip_cost = self.SLIP_COST * self.hop / step  # per hop
+        window = np.hanning(self.n_sym)
+        t = np.arange(self.n_sym) / sr
+        arg = 2 * np.pi * np.outer(t, np.asarray(spec.tones))
+        self.basis = np.concatenate([np.cos(arg), np.sin(arg)], axis=1).astype(np.float32) * \
+            window[:, None].astype(np.float32)  # (window, 2 * tones)
         self._grid = _grid(spec, sr, 64)
+        self._track = np.zeros((0, len(spec.tones)), np.float32)  # tone strengths, one row per hop
+        self.ends: list[int] = []  # sample just after each symbol read so far
 
-    def _bounds(self, k: int) -> tuple[int, int]:
+    def _nominal(self, k: int) -> int:
+        """Where symbol ``k``'s steady tone starts if nothing slipped, in samples after ``start``."""
         if k + 1 >= len(self._grid):
             self._grid = _grid(self.spec, self.sr, max(2 * len(self._grid), k + 2))
-        return int(self._grid[k]), int(self._grid[k + 1])
+        # screech: glide first, then the tone
+        return int(self._grid[k + 1]) - self.n_sym if self.spec.screech else int(self._grid[k])
 
-    def end_of(self, k: int) -> int:
-        """Sample just after symbol ``k`` (exclusive), drift included."""
-        return self.start + self._bounds(k)[1] + int(round(self.offset))
+    def need(self, count: int) -> int:
+        """Samples of signal wanted before reading ``count`` symbols."""
+        return self.start + self._nominal(count - 1) + self.n_sym + self.hop
 
-    def need(self, k: int) -> int:
-        """Samples of signal required to read symbol ``k`` (with room for drift)."""
-        b0, b1 = self._bounds(k)
-        end = b1 if self.spec.screech else b0 + self.n_sym
-        # signed: a sender whose clock runs fast finishes *earlier* than nominal
-        return self.start + end + int(round(self.offset)) + self.margin + 1
+    def _strengths(self, hops: int) -> np.ndarray:
+        """Tone strengths for measurement rows 0..hops-1. Row j looks at the samples from
+        ``start + (j - reach) * hop``; beyond the signal's ends it reads silence."""
+        have = len(self._track)
+        if hops > have:
+            reach = self._reach
+            rows = []
+            for lo in range(have, hops, 2048):  # in pieces: the windows of a long frame are many MB
+                hi = min(hops, lo + 2048)
+                first = self.start + (lo - reach) * self.hop
+                last = self.start + (hi - 1 - reach) * self.hop + self.n_sym
+                a, b = max(first, 0), min(last, len(self.sig))
+                seg = np.zeros(last - first, np.float32)
+                if b > a:
+                    seg[a - first:b - first] = self.sig[a:b]
+                frames = np.lib.stride_tricks.sliding_window_view(seg, self.n_sym)[::self.hop]
+                proj = frames @ self.basis
+                n = len(self.spec.tones)
+                rows.append(np.hypot(proj[:, :n], proj[:, n:]))
+            self._track = np.concatenate([self._track, *rows])
+        return self._track
 
-    def _energy(self, s: int, tone: int | None = None):
-        seg = self.sig[s:s + self.win]
-        if len(seg) < self.win:
-            seg = np.pad(seg, (0, self.win - len(seg)))
-        spec = self.basis if tone is None else self.basis[tone:tone + 1]
-        return np.abs(spec @ (seg * self.window))
+    @property
+    def _reach(self) -> int:
+        return self.lead + 2
 
-    def symbol(self, k: int) -> int:
-        b0, b1 = self._bounds(k)
-        steady = b1 - self.n_sym if self.spec.screech else b0  # screech: glide first, then the tone
-        s = self.start + steady + self.margin + int(round(self.offset))
-        sym = int(np.argmax(self._energy(s)))
-        e = self.margin
-        early = float(self._energy(s - e, sym)[0])
-        late = float(self._energy(s + e, sym)[0])
-        if early + late > 0:
-            # the drift itself can add up to many symbols' worth over a long
-            # message; what's limited is how far one noisy symbol can pull us
-            self.offset += self.GAIN * e * (late - early) / (late + early)
-        return sym
+    def read(self, count: int) -> tuple[list[int], list[float]]:
+        """The first ``count`` symbols and how doubtful each is (0 = certain, 1 = a coin toss)."""
+        hop, reach = self.hop, self._reach
+        centre = [int(round(self._nominal(k) / hop)) + reach for k in range(count)]
+        # how far the path may stray from the nominal grid: the lead, plus room for drift
+        # and slips that grows with the message
+        band = self.lead + int(0.02 * (centre[-1] - centre[0])) + 4 * self.max_slip
+        track = self._strengths(centre[-1] + band + 1)
+        peak = track.max(axis=1)
+        width = 2 * band + 1
+        offs = np.arange(-band, band + 1)
+        score = np.empty((count, width), np.float32)
+        for k, c in enumerate(centre):
+            idx = np.clip(c + offs, 0, len(peak) - 1)
+            score[k] = peak[idx]
+        usual = float(np.median(score.max(axis=1))) or 1.0
+        score = np.minimum(score / usual, 1.5)
+        slips = np.arange(-self.max_slip, self.max_slip + 1)
+        cost = (self.slip_cost * np.abs(slips)).astype(np.float32)
+        pad = np.full(self.max_slip, -np.inf, np.float32)
+        best = np.where(np.abs(offs) > self.lead, -np.inf, score[0] - self.slip_cost * np.abs(offs)).astype(np.float32)
+        back = np.zeros((count, width), np.int16)
+        for k in range(1, count):
+            prev = np.lib.stride_tricks.sliding_window_view(np.concatenate([pad, best, pad]), len(slips)) - cost
+            pick = prev.argmax(axis=1)
+            back[k] = pick
+            best = prev[np.arange(width), pick] + score[k]
+        at = int(best.argmax())
+        path = [0] * count
+        for k in range(count - 1, -1, -1):
+            path[k] = at
+            at += int(back[k][at]) - self.max_slip if k else 0
+        symbols, doubt, self.ends = [], [], []
+        for k in range(count):
+            row = track[min(centre[k] + path[k] - band, len(track) - 1)]
+            order = np.argsort(row)
+            top, second = float(row[order[-1]]), float(row[order[-2]])
+            symbols.append(int(order[-1]))
+            # unsure when another tone is nearly as strong, or when there's hardly any tone at all
+            doubt.append(max(second / top if top > 0 else 1.0, 1.0 - min(top / usual, 1.0)))
+            self.ends.append(self.start + (centre[k] + path[k] - band - reach) * hop + self.n_sym)
+        return symbols, doubt
 
 
 def data_start(pre_at: int, sr: int) -> int:
     return pre_at + int(PREAMBLE_SECONDS * sr) + int(PREAMBLE_GAP * sr)
 
 
-def try_decode_at(sig: np.ndarray, sr: int, pre_at: int, spec: ModeSpec, key: str | None = None):
+SLACK = 0.06  # seconds of sound wanted past a frame's nominal end: a call may have stretched it
+
+
+def try_decode_at(sig: np.ndarray, sr: int, pre_at: int, spec: ModeSpec, key: str | None = None,
+                  final: bool = False):
     """Decode a frame whose preamble starts at ``pre_at``.
 
     Returns (Message, end_sample). Raises codec.NeedMore with ``needed`` in
-    *samples* (absolute), or codec.BadFrame.
+    *samples* (absolute), or codec.BadFrame. ``final``: no more sound is
+    coming, so read what there is.
     """
     d = _Demod(sig, sr, data_start(pre_at, sr), spec)
     per = spec.symbols_per_byte
-    symbols: list[int] = []
-    want = 1
+    slack = int(SLACK * sr)
+    want = codec.HEADER_LEN
     while True:
-        target = want * per
-        while len(symbols) < target:
-            # check one symbol at a time: the drift estimate improves as we go,
-            # and a fast sender's frame ends earlier than the nominal grid says
-            if d.need(len(symbols)) > len(sig):
-                raise codec.NeedMore(d.need(target - 1))
-            symbols.append(d.symbol(len(symbols)))
+        count = want * per
+        # the header is read as soon as it's there; the whole frame with room for stretching
+        need = d.need(count) + (slack if want > codec.HEADER_LEN else 0)
+        if need > len(sig) and not final:
+            raise codec.NeedMore(need)
+        if d.need(count) - d.n_sym > len(sig):
+            raise codec.NeedMore(need)  # final, and it isn't all there: it was cut off
+        symbols, doubt = d.read(count)
+        data = symbols_to_bytes(symbols, spec.bits)
+        byte_doubt = [max(doubt[i * per:(i + 1) * per]) for i in range(len(data))]
         try:
-            msg, used = codec.parse_frame(symbols_to_bytes(symbols, spec.bits), key, spec.id)
-            return msg, d.end_of(used * per - 1)
+            msg, used = codec.parse_frame(data, key, spec.id, byte_doubt)
         except codec.NeedMore as e:
             want = e.needed
+            continue
+        end = d.ends[used * per - 1]
+        if end > len(sig) and not final:
+            raise codec.NeedMore(end + slack)  # stretched past what we have: its last tones aren't here yet
+        return msg, end
 
 
 def decode_audio(sig: np.ndarray, sr: int = DEFAULT_SR, mode: str = "auto", key: str | None = None,
@@ -355,7 +425,7 @@ def decode_audio(sig: np.ndarray, sr: int = DEFAULT_SR, mode: str = "auto", key:
             continue
         for spec in specs:
             try:
-                msg, end = try_decode_at(sig, sr, p, spec, key)
+                msg, end = try_decode_at(sig, sr, p, spec, key, final=True)
             except (codec.NeedMore, codec.BadFrame):
                 continue
             out.append(msg)
@@ -432,7 +502,7 @@ class StreamDecoder:
             broken = False
             for spec in self.specs:
                 try:
-                    msg, stop = try_decode_at(self.buf, self.sr, p - self.base, spec, self.key)
+                    msg, stop = try_decode_at(self.buf, self.sr, p - self.base, spec, self.key, final)
                 except codec.NeedMore as e:
                     need = self.base + e.needed
                     waiting = need if waiting is None else min(waiting, need)

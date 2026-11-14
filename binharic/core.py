@@ -129,6 +129,7 @@ Listener = Callable[[str, Event], None]
 
 class Translator:
     GUARD_SECONDS = 2.0  # how often the guard checks who records from the Binharic Mic
+    SILENT_SECONDS = 12.0  # a mic that has delivered only silence for this long gets a remark
 
     def __init__(self, settings: Settings):
         self.s = settings
@@ -493,9 +494,12 @@ class Translator:
                 block = np.zeros_like(block)  # keep timing, drop our own echo
             try:
                 self._mic_q.put_nowait((block, now))
-            except queue.Full:
-                self._mic_q.get_nowait()
-                self._mic_q.put_nowait((block, now))
+            except queue.Full:  # recognition is far behind: drop the oldest block
+                try:
+                    self._mic_q.get_nowait()
+                    self._mic_q.put_nowait((block, now))
+                except (queue.Empty, queue.Full):
+                    pass  # the other thread got in between; losing this one block is fine
 
     def _stt_loop(self):
         self.log("loading speech recognition…")
@@ -540,12 +544,14 @@ class Translator:
             audio = np.concatenate(blocks)
             if not warned_silent and not self.screeching.is_set():
                 peak = max(peak, float(np.abs(audio).max()))
-                if time.monotonic() - ready_at > 5:
+                if peak >= 3e-4:
+                    warned_silent = True  # it hears something: fine
+                elif time.monotonic() - ready_at > self.SILENT_SECONDS:
+                    # not an error: earbuds with a noise gate send pure silence until you speak
                     warned_silent = True
-                    if peak < 3e-4:
-                        self.log(f"the microphone ({self.mic_label}) is silent: is it muted or the wrong "
-                                 "device? `binharic devices` lists inputs (use --source NAME), or fix it in "
-                                 "pavucontrol", "error")
+                    self.log(f"nothing heard from the microphone ({self.mic_label}) yet. If you've been talking: "
+                             "is it muted or the wrong device? `binharic fix` finds the mic that hears you "
+                             "(or `binharic devices` + --source NAME)", "warn")
             if not (self.s.enabled or self.s.test):
                 if self.s.passthrough:
                     for b in blocks:

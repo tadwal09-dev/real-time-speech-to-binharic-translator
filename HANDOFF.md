@@ -1,7 +1,7 @@
 # Handoff: where we left off
 
 Read this first in a new session, then the README for what the user sees.
-Last updated: 2026-10-28 on branch `claude/happy-gates-btt1f9`.
+Last updated: 2026-11-14 on branch `claude/happy-gates-btt1f9`.
 
 ## What this is
 
@@ -22,6 +22,47 @@ The user (tadwa, on Arch) asked for, in order:
 All of that is built and was tested against a simulated desktop (see below). **It has not
 yet worked end to end on the user's real machine.** The latest report, below, is the
 current blocker.
+
+## Status after the latest session (2026-11-14): decoding over a call, `binharic update`, 0.5.0
+
+The user asked to "fix any bugs, build an update handler into it so one command checks for
+updates and updates, and fix the decoding". `experimental` (below) had never been shipped or
+installed, so on their machine `decode` still listened only to the mic and there was no
+`update`. This session merged it into the working branch and went on from there.
+
+- **Why decoding really failed over a call** (measured, not guessed). The old decoder was
+  fine against Opus at any bitrate, noise, clipping, 8 kHz audio, WebRTC noise suppression and
+  gain control. It died of two things a call does: lost packets (the receiver conceals each
+  with a guess) and the jitter buffer cutting out or repeating 2.5–15 ms. One wrong tone
+  failed the CRC and the whole message was lost. In a simulated call (WebRTC NS + AGC, Opus
+  24 kbps, 3% loss with real concealment, one cut/repeat a second) a 63-byte message arrived
+  2–3 times in 6; with 8% loss and two slips a second, never.
+- **Fix 1: error correction.** Frame version 2 (`codec.py`): Reed-Solomon parity on the
+  header and on the body. Version 1 frames are still read, never sent. **Old copies can't
+  read new screeches**: everyone has to update (the README says so). Version is 0.5.0.
+- **Fix 2: timing.** `modem._Demod` is a Viterbi tracker over per-millisecond tone
+  strengths instead of an early/late gate on a grid. It follows jumps, not just drift.
+- **Result**, same simulation, 63-byte message, 20 tries: hex 20/20 and binharic 19/20
+  (3% loss); hex 17/20 and binharic 19/20 (8% loss). Every clean-path case is as good as
+  before or better. **Binary mode is still weak over a call** (8/20 and 1/20): its 31 ms
+  beeps are no match for 15 ms cuts, and one wrong bit costs a whole byte of parity. That is
+  a limit of the mode, documented in the README, not something to tune away in the decoder.
+- The simulation isn't in the repo (it needs libopus through ctypes, `webrtc-noise-gain`
+  and scipy). Rebuild it if needed: WebRTC APM at 16 kHz in 10 ms frames → `opus_encode` /
+  `opus_decode` with packets dropped and `opus_decode(NULL)` for concealment → cut or repeat
+  2.5–15 ms at Poisson times. `tests/test_robust.py` has cheap stand-ins for each.
+- **`binharic update`** (`update.py`) was reworked: quick installer mode (no needless sudo,
+  only binharic reinstalled, nothing upgraded), finishes an update that was pulled but not
+  installed, `--force`, makes its own clone when not installed from one, restarts the
+  background service, `binharic --version` shows version and commit.
+- **Bugs fixed**: the mic thread could die of a race when its queue was full; "the
+  microphone is silent" was an error after 5 quiet seconds, a false alarm with the user's
+  earbuds (now a remark after 12 s); `git` errors in `update` printed a Python list.
+- **Verified on the user's desktop**: `say --sink binharic_out` → `decode --source
+  binharic_mic` in all three modes; plain `decode` read a call-damaged screech from an
+  app's own stream (played into a temporary null sink) and reported "1 damaged byte
+  repaired".
+- **Still unconfirmed**: a real Discord call with a friend. Both sides need 0.5.
 
 ## Branch `experimental` (copied from `claude/happy-gates-btt1f9` at `d2bdc36`, on the user's request)
 
@@ -219,8 +260,8 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 | `binharic/core.py` | `Translator`: the threads (mic, speech recognition, output, air decoder, incoming decoder, control socket at `$XDG_RUNTIME_DIR/binharic.sock`), muting, passthrough, test mode, timing measurements |
 | `binharic/stt.py` | Whisper engine (`small.en` final pass plus `base.en` live, speculative final pass, warm-up, GPU-to-CPU fallback, hallucination filter) and Vosk engine. `Transcriber` does the phrase/live logic (agreement, holding back the last word, `remaining_words` alignment) |
 | `binharic/vad.py` | Energy VAD with minimum-statistics noise floor, pause/resume events, `since_voice`; `Decimator` (48 kHz to 16 kHz) |
-| `binharic/modem.py` | Chirp sync plus FSK. Modes: binary (2 tones), hex and binharic (16 tones; binharic adds warble, buzz and glides). Exact timing grid, an early/late gate that tracks clock drift, and `StreamDecoder` that handles candidates without blocking |
-| `binharic/codec.py` | Frame format (magic/mode/flags, nonce, MAC tag, length, CRC-16), scrypt plus HMAC cipher, decoys, `split_text` (240-byte chunks) |
+| `binharic/modem.py` | Chirp sync plus FSK. Modes: binary (2 tones), hex and binharic (16 tones; binharic adds warble, buzz and glides). Exact timing grid for sending, a Viterbi tracker that follows drift and jumps for receiving, and `StreamDecoder` that handles candidates without blocking |
+| `binharic/codec.py` | Frame format (header, nonce, MAC tag, payload, CRC-16), Reed-Solomon error correction, scrypt plus HMAC cipher, decoys, `split_text` (160-byte chunks) |
 | `binharic/audio.py` | pacat/parec streams (errors at start, reconnect, `ensure_alive`), with PortAudio as the fallback; WAV input/output |
 | `binharic/pulse.py` | `pactl` helpers: create/remove the virtual mic (and restore the defaults), `real_source`/`real_sink` (never our own virtual devices), `check_device`, `probe_source` |
 | `binharic/fix.py` | `binharic fix`: the real repair tool (see status above), including resumable wheel downloads |
@@ -274,6 +315,5 @@ CUDA download that keeps dropping, and "doctor doesn't work"):
 - `main` holds the shipped code. Ship to it (fast-forward) only after CI passes three times in a
   row on the commit being shipped (`workflow_dispatch` reruns, `repeat` input for more rounds).
 - Read `ARCHITECTURE.md` before changing code, and update it when you change how something works.
-- Commit trailers: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and a
-  `Claude-Session:` line. Put no model names in code or docs.
+- Commit trailers: the `Co-Authored-By:` line your session gives you. Put no model names in code or docs.
 - Keep the user-facing README in sync, and add a regression test for every bug fixed.

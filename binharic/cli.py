@@ -170,7 +170,7 @@ def cmd_fix(args):
 
 def cmd_update(args):
     from . import update
-    sys.exit(update.run(check=args.check, branch=args.branch, say=lambda t: say_line(esc(t), t)))
+    sys.exit(update.run(check=args.check, branch=args.branch, force=args.force, say=lambda t: say_line(esc(t), t)))
 
 
 def cmd_listen(args):
@@ -348,10 +348,14 @@ def cmd_decode(args):
             return  # a decoy (or a different key)
         tag = modem.MODES_BY_ID[m.mode_id].name if m.mode_id in modem.MODES_BY_ID else "?"
         style = "yellow" if m.locked else "bold green"
-        frm = f"  [dim]{esc('(' + where + ')')}[/]" if where else ""
+        notes = [where] if where else []
+        if m.repaired:  # how rough the way here was: a lot of repairs means the next one may not make it
+            notes.append(f"{m.repaired} damaged byte{'s' if m.repaired != 1 else ''} repaired")
+        note = ", ".join(notes)
+        frm = f"  [dim]{esc('(' + note + ')')}[/]" if note else ""
         # decoded text is whatever someone sent: never let it be read as markup
         say_line(f"[{style}]▼ {esc('[' + tag + ']')} {esc(m.display())}[/]{frm}",
-                 f"<< [{tag}] {m.display()}" + (f"  ({where})" if where else ""))
+                 f"<< [{tag}] {m.display()}" + (f"  ({note})" if note else ""))
 
     if pulse.available() and not args.input_device:
         return _decode_incoming(args, key, show)
@@ -644,11 +648,20 @@ def _run_options(p, inherit: bool = False):
     g.add_argument("--input-device", help="PortAudio input device when not using --source")
 
 
+class _Version(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        from . import update
+        print(update.describe())
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="binharic", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Speak, and the machine screeches it: binary, hex or binharic, live.",
-        epilog="run `binharic <command> -h` for details · `binharic doctor` checks your setup")
+        epilog="run `binharic <command> -h` for details · `binharic doctor` checks your setup · "
+               "`binharic update` gets the newest version")
+    p.add_argument("-V", "--version", action=_Version, nargs=0, help="show the version and exit")
     _run_options(p)
     p.set_defaults(func=cmd_pick)
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
@@ -723,10 +736,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-y", "--yes", action="store_true", help="don't ask, just fix")
     s.add_argument("--no-gpu", action="store_true", help="skip the (1.5 GB) GPU library download")
     s.set_defaults(func=cmd_fix)
-    s = sub.add_parser("update", help="get the newest version, from any folder: pulls the clone you installed "
-                                      "from and reinstalls it")
-    s.add_argument("--check", action="store_true", help="only show what's new")
+    s = sub.add_parser("update", help="check for a newer version and install it (from any folder)")
+    s.add_argument("--check", action="store_true", help="only show what's new, install nothing")
     s.add_argument("--branch", help="follow another branch from now on: main (stable) or experimental")
+    s.add_argument("--force", action="store_true", help="reinstall even when nothing is new")
     s.set_defaults(func=cmd_update)
     s = sub.add_parser("ish", help="iSH on iOS: dictate or type, get sound files")
     s.add_argument("-m", "--mode", choices=list(modem.MODES), default="binharic")

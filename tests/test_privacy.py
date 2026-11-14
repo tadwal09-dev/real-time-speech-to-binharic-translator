@@ -1,6 +1,5 @@
 """Encryption and the three privacy options: unencrypted, encrypted, encrypted + gibberish."""
 
-import binascii
 import time
 
 import numpy as np
@@ -11,9 +10,13 @@ from binharic import cli, codec, core, modem
 KEY = "the omnissiah protects"
 
 
-def _recrc(frame: bytearray) -> bytes:
-    body = bytes(frame[:-2])
-    return body + binascii.crc_hqx(body, 0xFFFF).to_bytes(2, "big")
+def _forge(frame: bytes, change) -> bytes:
+    """What an attacker can do: take a frame apart, change a field, and put it back
+    together with a correct checksum and correct parity."""
+    flags, length = frame[0], frame[1]
+    body = bytearray(frame[codec.HEADER_LEN:codec.HEADER_LEN + codec.NONCE_LEN + codec.TAG_LEN + length])
+    flags, length, body = change(flags, length, body)
+    return codec._assemble(flags, bytes(body), length)
 
 
 # -- the cipher ---------------------------------------------------------------------
@@ -28,20 +31,19 @@ def test_round_trip_and_wrong_key():
 
 @pytest.mark.parametrize("where", ["flag", "nonce", "tag", "length", "ciphertext"])
 def test_any_tampering_is_rejected(where):
-    # an attacker who fixes up the CRC still can't change a single bit
-    f = bytearray(codec.build_frame("send 3 servitors", 2, KEY))
-    pos = {"nonce": 2, "tag": 1 + codec.NONCE_LEN + 1, "length": 1 + codec.NONCE_LEN + codec.TAG_LEN + 1,
-           "ciphertext": 1 + codec.NONCE_LEN + codec.TAG_LEN + 2 + 3}.get(where)
-    if where == "flag":
-        f[0] ^= 0x02  # claim another sound mode
-        m = codec.parse_frame(_recrc(f), KEY)[0]
-    elif where == "length":  # chop the last letter off and fix the length field to match
-        n = int.from_bytes(f[pos - 1:pos + 1], "big") - 1
-        f[pos - 1:pos + 1] = n.to_bytes(2, "big")
-        m = codec.parse_frame(_recrc(f[:-3] + f[-2:]), KEY)[0]
-    else:
-        f[pos] ^= 0x01
-        m = codec.parse_frame(_recrc(f), KEY)[0]
+    # an attacker who redoes the checksum and the parity still can't change a single bit
+    f = codec.build_frame("send 3 servitors", 2, KEY)
+    assert codec.parse_frame(_forge(f, lambda fl, n, body: (fl, n, body)), KEY)[0].text == "send 3 servitors"
+
+    def change(flags, length, body):
+        if where == "flag":
+            flags ^= 0x02  # claim another sound mode
+        elif where == "length":  # chop the last letter off
+            length, body = length - 1, body[:-1]
+        else:
+            body[{"nonce": 1, "tag": codec.NONCE_LEN + 1, "ciphertext": codec.NONCE_LEN + codec.TAG_LEN + 3}[where]] ^= 0x01
+        return flags, length, body
+    m = codec.parse_frame(_forge(f, change), KEY)[0]
     assert m.locked and m.text is None
 
 
@@ -64,7 +66,8 @@ def test_key_stretching_is_cached_and_quick():
 
 def test_overhead_stays_small():
     plain, enc = codec.build_frame("hello", 2), codec.build_frame("hello", 2, KEY)
-    assert len(enc) - len(plain) == codec.NONCE_LEN + codec.TAG_LEN == 12  # ~0.6 s of binharic
+    # the nonce and the tag (12 bytes), and the parity that protects them (4): ~0.8 s of binharic
+    assert len(enc) - len(plain) == codec.NONCE_LEN + codec.TAG_LEN + 4 == 16
 
 
 # -- the three privacy options in the layer ----------------------------------------------
