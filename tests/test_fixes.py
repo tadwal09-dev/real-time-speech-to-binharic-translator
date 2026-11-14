@@ -440,3 +440,71 @@ def test_input_dump_keeps_exactly_what_was_recorded(monkeypatch, tmp_path):
     assert len(files) == 1
     x, sr = audio.read_wav(str(files[0]))
     assert sr == 16000 and len(x) == 3200 and abs(x[0] - 0.1) < 1e-3 and abs(x[-1] - 0.2) < 1e-3
+
+
+def _spoken(name: str, sr: int = 48000) -> np.ndarray:
+    """One of the e2e speech recordings (16 kHz), at the layer's rate."""
+    from pathlib import Path
+
+    from binharic.audio import read_wav
+    x, rate = read_wav(str(Path(__file__).parent / "e2e" / "fixtures" / f"{name}.wav"))
+    return np.interp(np.arange(0, len(x), rate / sr), np.arange(len(x)), x).astype(np.float32)
+
+
+def test_our_own_screech_arriving_late_is_not_transcribed():
+    # regression (it failed CI once and loops forever with Bluetooth speakers): in half
+    # duplex the mic is ignored while a screech plays, but speakers that play late deliver
+    # its end after that window. Whisper made "All right." / "Thank you very much." of it,
+    # the layer screeched those, heard their end too, and never went idle
+    import queue as queue_mod
+    import time as time_mod
+
+    sr = 48000
+    speech = _spoken("machine")
+    tail = modem.encode_text("the end of a long screech", "binharic", volume=0.3)[-int(0.8 * sr):]
+    audio = np.concatenate([tail, np.zeros(int(0.6 * sr), np.float32), speech[:int(1.2 * sr)]]).astype(np.float32)
+
+    class LateSpeakers:
+        pos = 0
+
+        def read(self):
+            if self.pos >= len(audio):
+                raise EOFError
+            block = audio[self.pos:self.pos + 1920]
+            self.pos += 1920
+            time_mod.sleep(0.04)  # real time, like a mic
+            return block
+    logs = []
+    tr = core.Translator(core.Settings(control_socket=False, duplex="half"))
+    tr.subscribe(lambda kind, ev: kind == "log" and logs.append(ev["text"]))
+    tr._mic, tr._mic_q = LateSpeakers(), queue_mod.Queue()
+    now = time_mod.monotonic()
+    tr._mute_until, tr._echo_until = now, now + tr.ECHO_SECONDS  # the screech "ended" just now
+    tr._mic_loop()
+    heard = np.concatenate([b for b, _ in list(tr._mic_q.queue)])
+    n_tail = len(tail) // 1920 * 1920
+    assert float(np.abs(heard[:n_tail]).max()) == 0.0, "the late screech reached speech recognition"
+    said = heard[len(tail) + int(0.6 * sr):]
+    assert float(np.sqrt(np.mean(said ** 2))) > 0.5 * float(np.sqrt(np.mean(speech[:len(said)] ** 2))), \
+        "what was said afterwards must get through"
+    assert sum("play late" in t for t in logs) == 1
+
+    # full duplex (the virtual mic: nothing can leak back) is never touched
+    tr = core.Translator(core.Settings(control_socket=False, duplex="full"))
+    tr._mic, tr._mic_q = LateSpeakers(), queue_mod.Queue()
+    now = time_mod.monotonic()
+    tr._mute_until, tr._echo_until = now, now + tr.ECHO_SECONDS
+    tr._mic_loop()
+    assert float(np.abs(np.concatenate([b for b, _ in list(tr._mic_q.queue)])[:n_tail]).max()) > 0.1
+
+
+def test_screech_tones_are_told_from_speech():
+    for mode in modem.MODES:
+        x = modem.encode_text("the flesh is weak", mode, volume=0.4)[int(0.2 * 48000):-int(0.06 * 48000)]
+        flags = [modem.looks_like_screech(x[i:i + 1920]) for i in range(0, len(x) - 1920, 1920)]
+        assert np.mean(flags) > 0.9, mode
+    for name in ("hello", "machine", "flesh"):
+        x = _spoken(name)
+        flags = [modem.looks_like_screech(x[i:i + 1920]) for i in range(0, len(x) - 1920, 1920)]
+        assert np.mean(flags) < 0.1, name
+    assert not modem.looks_like_screech(np.zeros(1920, np.float32))

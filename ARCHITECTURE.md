@@ -140,7 +140,12 @@ can do goes through `Translator` methods (`toggle`, `set_send_mode`,
   the mic is ignored while screeching and until the end has actually
   played (the output's `latency`, which is large on Windows) plus 0.4 s,
   so the layer never transcribes its own screech. Test mode is always
-  half duplex.
+  half duplex. Speakers that play later than that (Bluetooth, a slow
+  loopback) are caught by `_own_echo`: for `ECHO_SECONDS` after the mute
+  window, mic blocks that are mostly one or two tones in the screech's band
+  (`modem.looks_like_screech`) are ignored too, and 0.3 s after each. Without
+  it Whisper made words of the screech's end, they were screeched, and so on
+  forever.
 * A whole chunk is synthesised before any of it plays (a gap mid-screech
   corrupts it). Writes are 100 ms, and `_abort` (OFF) cuts a screech
   between writes.

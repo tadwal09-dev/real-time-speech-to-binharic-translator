@@ -372,6 +372,29 @@ class _Demod:
         return symbols, doubt
 
 
+def looks_like_screech(block: np.ndarray, sr: int = DEFAULT_SR) -> bool:
+    """Is this short block of sound (tens of ms) mostly one or two tones in the screech's
+    band? Any mode's data tones are; speech rarely is. Used to tell our own screech,
+    coming back late through speakers and a mic, from someone talking."""
+    n = len(block)
+    if n < 256:
+        return False
+    x = np.asarray(block, np.float64)
+    spec = np.abs(np.fft.rfft((x - x.mean()) * np.hanning(n))) ** 2
+    total = float(spec[1:].sum())
+    if total < 1e-7 * n:
+        return False  # silence
+    hz = sr / n
+    lo, hi, width = int(600 / hz), int(3500 / hz), max(1, int(round(110 / hz)))
+    tones = 0.0
+    for _ in range(2):  # a block often straddles two symbols
+        k = lo + int(np.argmax(spec[lo:hi]))
+        a, b = max(k - width, 1), k + width + 1
+        tones += float(spec[a:b].sum())
+        spec[a:b] = 0
+    return tones / total > 0.6
+
+
 def data_start(pre_at: int, sr: int) -> int:
     return pre_at + int(PREAMBLE_SECONDS * sr) + int(PREAMBLE_GAP * sr)
 

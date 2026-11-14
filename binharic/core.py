@@ -130,6 +130,8 @@ Listener = Callable[[str, Event], None]
 class Translator:
     GUARD_SECONDS = 2.0  # how often the guard checks who records from the Binharic Mic
     SILENT_SECONDS = 12.0  # a mic that has delivered only silence for this long gets a remark
+    ECHO_SECONDS = 1.5     # after the mute window: how long a late end of our own screech is watched for
+    ECHO_HOLD = 0.3        # ...and how long the mic stays ignored after the last block that sounded like it
 
     def __init__(self, settings: Settings):
         self.s = settings
@@ -164,6 +166,9 @@ class Translator:
         self._local_out: Output | None = None
         self._air_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=600)
         self._mute_until = 0.0
+        self._echo_until = 0.0        # until then, sound that looks like our screech is our screech
+        self._echo_hold = 0.0
+        self._echo_noted = False
         self._last_arrival = 0.0
         self._target_lock = threading.Lock()
 
@@ -485,7 +490,8 @@ class Translator:
             except EOFError:
                 break
             now = time.monotonic()
-            if (self.screeching.is_set() or now < self._mute_until) and not self.full_duplex:
+            if not self.full_duplex and (self.screeching.is_set() or now < self._mute_until
+                                         or self._own_echo(block, now)):
                 if self.s.test and self.s.test_air:
                     try:
                         self._air_q.put_nowait(block)
@@ -500,6 +506,22 @@ class Translator:
                     self._mic_q.put_nowait((block, now))
                 except (queue.Empty, queue.Full):
                     pass  # the other thread got in between; losing this one block is fine
+
+    def _own_echo(self, block: np.ndarray, now: float) -> bool:
+        """Half duplex, shortly after a screech: is the mic still hearing it? Speakers that
+        play late (Bluetooth, a slow loopback) deliver the end of a screech after the mute
+        window. Whisper makes words of it ("All right.", "Thank you very much."), those
+        are screeched, and their end is heard too: a loop that never stops."""
+        if now >= self._echo_until:
+            return False
+        if modem.looks_like_screech(block, SR):
+            self._echo_hold = now + self.ECHO_HOLD
+            self._echo_until = max(self._echo_until, self._echo_hold)  # for as long as it lasts
+            if not self._echo_noted:
+                self._echo_noted = True
+                self.log("your speakers play late: the mic still heard the end of the screech. "
+                         "Ignoring it (and anything said in that moment)", "warn")
+        return now < self._echo_hold
 
     def _stt_loop(self):
         self.log("loading speech recognition…")
@@ -703,6 +725,7 @@ class Translator:
             # playing for the output's latency (large on Windows), then the
             # speaker/room tail. Keep the mic muted (and --air listening) until then
             self._mute_until = time.monotonic() + float(getattr(out, "latency", 0.0) or 0.0) + 0.4
+            self._echo_until = self._mute_until + self.ECHO_SECONDS
             self.screeching.clear()
             self._changed()
 

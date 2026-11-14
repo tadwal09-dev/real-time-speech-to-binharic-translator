@@ -55,6 +55,11 @@ installed, so on their machine `decode` still listened only to the mic and there
   only binharic reinstalled, nothing upgraded), finishes an update that was pulled but not
   installed, `--force`, makes its own clone when not installed from one, restarts the
   background service, `binharic --version` shows version and commit.
+- **A feedback loop in half duplex / test mode** (it was the "flaky" Ubuntu CI failure of
+  `test_mode_round_trip_and_over_the_air` on `main`): speakers that play late delivered the
+  end of a screech after the mute window, Whisper heard "All right." / "Thank you very
+  much." in it, the layer screeched that, and never went idle. `core._own_echo` now ignores
+  mic sound that looks like a screech for 1.5 s after the mute window.
 - **Bugs fixed**: the mic thread could die of a race when its queue was full; "the
   microphone is silent" was an error after 5 quiet seconds, a false alarm with the user's
   earbuds (now a remark after 12 s); `git` errors in `update` printed a Python list.
