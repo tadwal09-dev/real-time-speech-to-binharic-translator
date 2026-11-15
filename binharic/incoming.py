@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from collections.abc import Callable
 
 from . import codec, modem, pulse
 from .audio import Input
@@ -46,10 +46,8 @@ def playing_apps(ignore: tuple[str, ...] = ("binharic",)) -> dict[int, str]:
             return {}
     out = {}
     for index, p in streams:
-        app = p.get("application.name") or ""
-        if app in ignore:
-            continue
-        out[index] = " · ".join(dict.fromkeys(filter(None, (app, p.get("media.name"))))) or "an app"
+        if (p.get("application.name") or "") not in ignore:
+            out[index] = pulse.app_label(p)
     return out
 
 

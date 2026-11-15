@@ -12,6 +12,7 @@ decoder locks onto, followed by one tone per symbol:
 
 from __future__ import annotations
 
+import functools
 import random
 from dataclasses import dataclass
 
@@ -36,7 +37,7 @@ class ModeSpec:
     guard: float   # seconds between tones
     screech: bool = False
 
-    def scaled(self, speed: float) -> "ModeSpec":
+    def scaled(self, speed: float) -> ModeSpec:
         return ModeSpec(self.name, self.id, self.bits, self.tones,
                         self.symbol / speed, self.guard / speed, self.screech)
 
@@ -84,12 +85,16 @@ def symbols_to_bytes(symbols: list[int], bits: int) -> bytes:
 # --------------------------------------------------------------------------
 # synthesis
 
+@functools.lru_cache(maxsize=8)
 def preamble(sr: int) -> np.ndarray:
+    """The sync chirp. Shared: don't change the array."""
     n = int(PREAMBLE_SECONDS * sr)
     t = np.arange(n) / sr
     k = (PREAMBLE_F1 - PREAMBLE_F0) / PREAMBLE_SECONDS
     sig = np.sin(2 * np.pi * (PREAMBLE_F0 * t + 0.5 * k * t * t))
-    return (sig * _fade(n, int(0.005 * sr))).astype(np.float32)
+    out = (sig * _fade(n, int(0.005 * sr))).astype(np.float32)
+    out.flags.writeable = False
+    return out
 
 
 def _fade(n: int, ramp: int) -> np.ndarray:
@@ -155,15 +160,10 @@ def _screech(symbols: list[int], spec: ModeSpec, sr: int, rng: np.random.Generat
     return np.tanh(1.4 * sig) * env
 
 
-_LEAD_IN: dict[int, np.ndarray] = {}
-
-
 def lead_in(sr: int = DEFAULT_SR, volume: float = 0.8) -> np.ndarray:
     """Sync chirp + gap. Identical for every message, so it can start playing
     before the rest of the message has been synthesised."""
-    if sr not in _LEAD_IN:
-        _LEAD_IN[sr] = np.concatenate([preamble(sr), np.zeros(int(PREAMBLE_GAP * sr), np.float32)])
-    return _LEAD_IN[sr] * np.float32(volume)
+    return np.concatenate([preamble(sr) * np.float32(volume), np.zeros(int(PREAMBLE_GAP * sr), np.float32)])
 
 
 def modulate_body(frame: bytes, spec: ModeSpec, sr: int = DEFAULT_SR, volume: float = 0.8,
@@ -211,27 +211,28 @@ def encode_text(text: str, mode: str = "binharic", key: str | None = None, sr: i
                            for c in chunks for _, frame in frames_with_decoys(c, spec.id, key, decoys)])
 
 
-def encode_body(text: str, mode: str = "binharic", key: str | None = None, sr: int = DEFAULT_SR,
-                speed: float = 1.0, volume: float = 0.8) -> np.ndarray:
-    spec = get_mode(mode, speed)
-    return modulate_body(codec.build_frame(text, spec.id, key), spec, sr, volume)
-
-
 # --------------------------------------------------------------------------
 # demodulation
 
+@functools.lru_cache(maxsize=16)
+def _chirp_spectrum(sr: int, size: int) -> tuple[np.ndarray, float]:
+    """The sync chirp ready to correlate against ``size`` samples: (conjugate spectrum, its norm)."""
+    tpl = preamble(sr).astype(np.float64)
+    return np.conj(np.fft.rfft(tpl, size)), float(np.linalg.norm(tpl))
+
+
 def find_preambles(sig: np.ndarray, sr: int, threshold: float = 0.45) -> list[int]:
     """Return sample offsets where a sync chirp starts, in order."""
-    tpl = preamble(sr).astype(np.float64)
-    m, n = len(tpl), len(sig)
+    m, n = int(PREAMBLE_SECONDS * sr), len(sig)
     if n < m:
         return []
     x = sig.astype(np.float64)
     size = 1 << int(np.ceil(np.log2(n + m)))
-    corr = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(tpl, size)), size)[:n - m + 1]
+    spectrum, norm = _chirp_spectrum(sr, size)
+    corr = np.fft.irfft(np.fft.rfft(x, size) * spectrum, size)[:n - m + 1]
     c2 = np.concatenate([[0.0], np.cumsum(x * x)])
     local = np.sqrt(np.maximum(c2[m:] - c2[:-m], 0.0))
-    ncc = corr / (np.linalg.norm(tpl) * local + 1e-9)
+    ncc = corr / (norm * local + 1e-9)
 
     peaks = []
     above = np.flatnonzero(ncc > threshold)
@@ -251,6 +252,14 @@ def find_preambles(sig: np.ndarray, sr: int, threshold: float = 0.45) -> list[in
         if all(abs(p - q) >= m for q in kept):
             kept.append(p)
     return sorted(kept)
+
+
+@functools.lru_cache(maxsize=16)
+def _basis(tones: tuple[float, ...], n_sym: int, sr: int) -> np.ndarray:
+    """A windowed cosine and sine of every tone, one tone-length long: (window, 2 * tones)."""
+    arg = 2 * np.pi * np.outer(np.arange(n_sym) / sr, np.asarray(tones))
+    window = np.hanning(n_sym)[:, None].astype(np.float32)
+    return np.concatenate([np.cos(arg), np.sin(arg)], axis=1).astype(np.float32) * window
 
 
 class _Demod:
@@ -282,11 +291,8 @@ class _Demod:
         self.max_slip = max(1, int(min(self.MAX_SLIP * sr, 0.45 * step) / self.hop))
         self.lead = max(1, int(min(self.LEAD * sr, 0.4 * step) / self.hop))
         self.slip_cost = self.SLIP_COST * self.hop / step  # per hop
-        window = np.hanning(self.n_sym)
-        t = np.arange(self.n_sym) / sr
-        arg = 2 * np.pi * np.outer(t, np.asarray(spec.tones))
-        self.basis = np.concatenate([np.cos(arg), np.sin(arg)], axis=1).astype(np.float32) * \
-            window[:, None].astype(np.float32)  # (window, 2 * tones)
+        self.reach = self.lead + 2  # measurement rows before the nominal start
+        self.basis = _basis(spec.tones, self.n_sym, sr)
         self._grid = _grid(spec, sr, 64)
         self._track = np.zeros((0, len(spec.tones)), np.float32)  # tone strengths, one row per hop
         self.ends: list[int] = []  # sample just after each symbol read so far
@@ -307,7 +313,7 @@ class _Demod:
         ``start + (j - reach) * hop``; beyond the signal's ends it reads silence."""
         have = len(self._track)
         if hops > have:
-            reach = self._reach
+            reach = self.reach
             rows = []
             for lo in range(have, hops, 2048):  # in pieces: the windows of a long frame are many MB
                 hi = min(hops, lo + 2048)
@@ -324,25 +330,18 @@ class _Demod:
             self._track = np.concatenate([self._track, *rows])
         return self._track
 
-    @property
-    def _reach(self) -> int:
-        return self.lead + 2
-
     def read(self, count: int) -> tuple[list[int], list[float]]:
         """The first ``count`` symbols and how doubtful each is (0 = certain, 1 = a coin toss)."""
-        hop, reach = self.hop, self._reach
-        centre = [int(round(self._nominal(k) / hop)) + reach for k in range(count)]
+        hop, reach = self.hop, self.reach
+        centre = np.array([int(round(self._nominal(k) / hop)) + reach for k in range(count)])
         # how far the path may stray from the nominal grid: the lead, plus room for drift
         # and slips that grows with the message
         band = self.lead + int(0.02 * (centre[-1] - centre[0])) + 4 * self.max_slip
-        track = self._strengths(centre[-1] + band + 1)
+        track = self._strengths(int(centre[-1]) + band + 1)
         peak = track.max(axis=1)
         width = 2 * band + 1
         offs = np.arange(-band, band + 1)
-        score = np.empty((count, width), np.float32)
-        for k, c in enumerate(centre):
-            idx = np.clip(c + offs, 0, len(peak) - 1)
-            score[k] = peak[idx]
+        score = peak[np.clip(centre[:, None] + offs, 0, len(peak) - 1)]  # (symbol, offset)
         usual = float(np.median(score.max(axis=1))) or 1.0
         score = np.minimum(score / usual, 1.5)
         slips = np.arange(-self.max_slip, self.max_slip + 1)
@@ -356,20 +355,20 @@ class _Demod:
             back[k] = pick
             best = prev[np.arange(width), pick] + score[k]
         at = int(best.argmax())
-        path = [0] * count
+        path = np.zeros(count, np.int64)
         for k in range(count - 1, -1, -1):
             path[k] = at
             at += int(back[k][at]) - self.max_slip if k else 0
-        symbols, doubt, self.ends = [], [], []
-        for k in range(count):
-            row = track[min(centre[k] + path[k] - band, len(track) - 1)]
-            order = np.argsort(row)
-            top, second = float(row[order[-1]]), float(row[order[-2]])
-            symbols.append(int(order[-1]))
-            # unsure when another tone is nearly as strong, or when there's hardly any tone at all
-            doubt.append(max(second / top if top > 0 else 1.0, 1.0 - min(top / usual, 1.0)))
-            self.ends.append(self.start + (centre[k] + path[k] - band - reach) * hop + self.n_sym)
-        return symbols, doubt
+        at = centre + path - band  # the measurement row each symbol was read at
+        heard = track[np.minimum(at, len(track) - 1)]  # (symbol, tone)
+        ranked = np.sort(heard, axis=1)
+        top, second = ranked[:, -1].astype(np.float64), ranked[:, -2]
+        symbols = heard.argmax(axis=1)
+        # unsure when another tone is nearly as strong, or when there's hardly any tone at all
+        rival = np.divide(second, top, out=np.ones(count), where=top > 0)
+        doubt = np.maximum(rival, 1.0 - np.minimum(top / usual, 1.0))
+        self.ends = (self.start + (at - reach) * hop + self.n_sym).tolist()
+        return symbols.tolist(), doubt.tolist()
 
 
 def looks_like_screech(block: np.ndarray, sr: int = DEFAULT_SR) -> bool:
@@ -436,10 +435,14 @@ def try_decode_at(sig: np.ndarray, sr: int, pre_at: int, spec: ModeSpec, key: st
         return msg, end
 
 
+def _specs(mode: str, speed: float) -> list[ModeSpec]:
+    return [get_mode(m, speed) for m in (MODES if mode == "auto" else [mode])]
+
+
 def decode_audio(sig: np.ndarray, sr: int = DEFAULT_SR, mode: str = "auto", key: str | None = None,
                  speed: float = 1.0, threshold: float = 0.45) -> list[codec.Message]:
     """Decode every complete transmission found in ``sig``."""
-    specs = [get_mode(m, speed) for m in (MODES if mode == "auto" else [mode])]
+    specs = _specs(mode, speed)
     sig = np.asarray(sig, dtype=np.float32)
     out = []
     end = 0
@@ -470,7 +473,7 @@ class StreamDecoder:
         self.sr = sr
         self.key = key
         self.threshold = threshold
-        self.specs = [get_mode(m, speed) for m in (MODES if mode == "auto" else [mode])]
+        self.specs = _specs(mode, speed)
         self.buf = np.zeros(0, dtype=np.float32)
         self.base = 0                 # absolute sample index of buf[0]
         self.max_buffer = int(max_buffer_seconds * sr)
@@ -485,9 +488,8 @@ class StreamDecoder:
         self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=np.float32).ravel()])
         if len(self.buf) > self.max_buffer:
             self._drop(len(self.buf) - self.max_buffer)
-        if self.base + len(self.buf) - self._searched < self.sr // 4:
-            return self._try(final=False)  # not enough new audio to look for chirps yet
-        self._search()
+        if self.base + len(self.buf) - self._searched >= self.sr // 4:  # enough new audio to look for chirps
+            self._search()
         return self._try(final=False)
 
     def flush(self) -> list[codec.Message]:

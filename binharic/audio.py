@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import wave
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
@@ -40,6 +40,14 @@ def _require(tool: str) -> str:
     if not path:
         raise RuntimeError(f"`{tool}` not found - install it with: sudo pacman -S libpulse")
     return path
+
+
+def to_pcm16(samples: np.ndarray) -> bytes:
+    return (np.clip(np.asarray(samples, dtype=np.float32), -1, 1) * 32767).astype("<i2").tobytes()
+
+
+def from_pcm16(raw: bytes) -> np.ndarray:
+    return np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
 
 
 def _warn(msg: str) -> None:
@@ -211,7 +219,7 @@ class Output:
     def write(self, samples: np.ndarray) -> None:
         samples = np.asarray(samples, dtype=np.float32).ravel()
         if self._pulse:
-            pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+            pcm = to_pcm16(samples)
             while True:
                 try:
                     self._pulse.proc.stdin.write(pcm)
@@ -242,17 +250,19 @@ class Input:
         self._warned_overflow = -1e9
         self._pulse: _PulseStream | None = None
         self._stream = None
+
+        def parec(target: str, latency_ms: int) -> list[str]:
+            return [_require("parec"), target, "--raw", "--format=s16le", f"--rate={sr}", "--channels=1",
+                    f"--latency-msec={latency_ms}", "--client-name=binharic"]
+
         if app_stream is not None:
             # one app's playback on its own (what pavucontrol's per-app meters use): ends with the app's stream
-            self._pulse = _PulseStream(
-                [_require("parec"), f"--monitor-stream={app_stream}", "--raw", "--format=s16le",
-                 f"--rate={sr}", "--channels=1", "--latency-msec=100", "--client-name=binharic"],
-                f"record app stream {app_stream}", playback=False, notify=notify, reconnect=False)
+            self._pulse = _PulseStream(parec(f"--monitor-stream={app_stream}", 100),
+                                       f"record app stream {app_stream}", playback=False, notify=notify,
+                                       reconnect=False)
         elif source:
-            self._pulse = _PulseStream(
-                [_require("parec"), f"--device={source}", "--raw", "--format=s16le",
-                 f"--rate={sr}", "--channels=1", "--latency-msec=20", "--client-name=binharic"],
-                f"record from '{source}'", playback=False, notify=notify, device=source)
+            self._pulse = _PulseStream(parec(f"--device={source}", 20), f"record from '{source}'",
+                                       playback=False, notify=notify, device=source)
         else:
             import sounddevice as sd
             # "high": with "low", Windows' MME gets a few tiny buffers and drops input
@@ -276,7 +286,7 @@ class Input:
             while True:
                 raw = self._pulse.proc.stdout.read(self.blocksize * 2)
                 if raw:
-                    return np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
+                    return from_pcm16(raw)
                 self._pulse.recover()  # EOF: parec died (server restart?) - EOFError once closed
         data, overflow = self._stream.read(self.blocksize)
         if overflow:
@@ -303,12 +313,11 @@ class Input:
 
 
 def write_wav(path: str, samples: np.ndarray, sr: int) -> None:
-    pcm = (np.clip(np.asarray(samples, dtype=np.float32), -1, 1) * 32767).astype("<i2")
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(sr)
-        w.writeframes(pcm.tobytes())
+        w.writeframes(to_pcm16(samples))
 
 
 def read_wav(path: str) -> tuple[np.ndarray, int]:
@@ -323,7 +332,7 @@ def read_wav(path: str) -> tuple[np.ndarray, int]:
     if width == 1:
         data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128.0
     elif width == 2:
-        data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        data = from_pcm16(raw)
     elif width == 3:
         b = np.frombuffer(raw[: len(raw) // 3 * 3], dtype=np.uint8).reshape(-1, 3).astype(np.int32)
         v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)

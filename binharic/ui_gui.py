@@ -5,7 +5,7 @@ from __future__ import annotations
 import queue
 import time
 
-from .core import Translator
+from .core import Translator, meter
 from .stt import LIVE, PHRASE
 
 BG, PANEL, FG, DIM = "#121012", "#1d191c", "#e8dcd0", "#8a7f78"
@@ -161,8 +161,8 @@ def run(tr: Translator) -> None:
     # -- meter + live text --------------------------------------------------
     live = tk.Frame(root, bg=BG)
     live.pack(fill="x", padx=16, pady=(12, 4))
-    meter = tk.Canvas(live, height=14, bg=PANEL, highlightthickness=0)
-    meter.pack(fill="x")
+    bar = tk.Canvas(live, height=14, bg=PANEL, highlightthickness=0)
+    bar.pack(fill="x")
     status_lbl = tk.Label(live, text="", bg=BG, fg=DIM, font=(ui[0], 10, "bold"), anchor="w")
     status_lbl.pack(fill="x", pady=(4, 0))
     partial_lbl = tk.Label(live, text="", bg=BG, fg=FG, font=(ui[0], 11, "italic"), anchor="w",
@@ -284,10 +284,10 @@ def run(tr: Translator) -> None:
         if changed:
             refresh()
 
-        w = meter.winfo_width()
-        lvl = min(1.0, (state["level"] * 12) ** 0.6)
-        meter.delete("all")
-        meter.create_rectangle(0, 0, int(w * lvl), 14, fill=GREEN if tr.speaking else "#4a6b78", width=0)
+        w = bar.winfo_width()
+        bar.delete("all")
+        bar.create_rectangle(0, 0, int(w * meter(state["level"])), 14, fill=GREEN if tr.speaking else "#4a6b78",
+                             width=0)
         if not tr.ready and not tr.stopped:
             status_lbl.configure(text="loading the speech model…", fg=DIM)
         elif tr.s.test and not tr.screeching.is_set():

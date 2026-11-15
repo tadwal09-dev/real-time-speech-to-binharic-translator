@@ -188,6 +188,11 @@ interrupt `accept()` on Windows.
   symbol). `--speed` scales the symbol time, and both sides must use the
   same speed.
 * `find_preambles` uses FFT normalised cross-correlation against the chirp.
+* What never changes is computed once and cached (`functools.lru_cache`): the chirp
+  (`preamble`, a read-only array), its spectrum per FFT size (`_chirp_spectrum`) and the
+  tone table per mode and speed (`_basis`). The live decoder calls these many times a
+  second. `_basis` multiplies in float32 on purpose: the decoder's output is bit-for-bit
+  what 0.5.0 gave, and near-ties in the timing path depend on the last bit.
 * `_Demod` reads a frame's symbols without trusting the time grid. It measures every
   tone's strength every millisecond (`_strengths`: a Hann window one symbol long, all
   tones in one matrix product) and finds the best path through them with Viterbi
@@ -256,6 +261,8 @@ flags 1 (0xC0 | mode_id<<1 | encrypted) · length 1 · header parity 4
 * The key comes from scrypt(N=2^14, r=8, p=1, a fixed salt) and is split
   into an encryption key and a MAC key. `_keys` is `lru_cache`d, so it's
   about 0.1 s once per passphrase.
+* `_seal` (encrypt + tag) and `_open` (check the tag + decrypt, `None` if it doesn't match)
+  serve both frame versions; `_message` turns the result into a `Message`.
 * The ciphertext is the payload XOR an HMAC-SHA256(enc_key, nonce || counter)
   stream. The tag is HMAC-SHA256(mac_key, flags + nonce + length +
   ciphertext)[:6], checked with `hmac.compare_digest`.
@@ -289,6 +296,11 @@ flags 1 (0xC0 | mode_id<<1 | encrypted) · length 1 · header parity 4
   (`XDG_DATA_HOME`) on Linux, `%LOCALAPPDATA%\binharic` on Windows.
 
 ## 8. Audio I/O: `audio.py`, `pulse.py`, `pa.py`
+
+* One of each, used everywhere: `audio.to_pcm16` / `from_pcm16` (float ↔ the 16-bit
+  samples pacat, parec, WAV files and Vosk speak), `pulse.is_ours` (a source that is not
+  a microphone: our virtual devices, any monitor) and `pulse.app_label` (how a stream is
+  named in messages).
 
 * `Input`/`Output` with a `source`/`sink` name start `parec`/`pacat` in
   their own session. Ctrl+C in the terminal must not kill them; we close

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -36,16 +35,13 @@ def to_wav(text: str, mode: str = "binharic", key: str | None = None, speed: flo
     audio = modem.encode_text(text, mode, key=key, sr=SR, speed=speed, volume=0.8, decoys=decoys)
     # the Files app sorts by name: a counter that always sorts after the last
     # file (never "...-2.wav", which sorts before "....wav") and never overwrites
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    taken = sorted(p.name for p in outbox().glob(f"{stamp}-*.wav"))
+    folder, stamp = outbox(), time.strftime("%Y%m%d-%H%M%S")
+    taken = sorted(p.name for p in folder.glob(f"{stamp}-*.wav"))
     n = int(taken[-1][len(stamp) + 1:-4]) + 1 if taken and taken[-1][len(stamp) + 1:-4].isdigit() else 1
-    path = outbox() / f"{stamp}-{n:02d}.wav"
-    while path.exists():
+    while (path := folder / f"{stamp}-{n:02d}.wav").exists():
         n += 1
-        path = outbox() / f"{stamp}-{n:02d}.wav"
     write_wav(str(path), audio, SR)
-    latest = outbox() / "latest.wav"
-    shutil.copyfile(path, latest)
+    shutil.copyfile(path, folder / "latest.wav")
     return path
 
 
@@ -80,4 +76,4 @@ def run(mode: str = "binharic", key: str | None = None, speed: float = 1.0, show
         t = time.monotonic()
         path = to_wav(line, mode, key, speed, decoys)
         shown = codec.to_binary(line) if show == "binary" else codec.to_hex(line)
-        print(f"  {shown}\n  -> {path.name} ({time.monotonic() - t:.1f}s)", file=sys.stdout)
+        print(f"  {shown}\n  -> {path.name} ({time.monotonic() - t:.1f}s)")

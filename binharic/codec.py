@@ -116,14 +116,21 @@ def _poly_mul(p: list[int], q: list[int]) -> list[int]:
     return out
 
 
-def _poly_eval(p: list[int], x: int) -> int:
-    y = 0
-    for c in reversed(p):
-        y = _mul(y, x) ^ c
+def _horner(coeffs, x: int) -> int:
+    """The polynomial with ``coeffs`` (highest power first) at ``x``."""
+    if not x:
+        return coeffs[-1] if len(coeffs) else 0
+    y, lx = 0, _LOG[x]
+    for c in coeffs:
+        y = (_EXP[_LOG[y] + lx] if y else 0) ^ c
     return y
 
 
-@functools.lru_cache(maxsize=None)
+def _poly_eval(p: list[int], x: int) -> int:
+    return _horner(p[::-1], x)
+
+
+@functools.cache
 def _generator(nsym: int) -> tuple[int, ...]:
     g = [1]
     for i in range(nsym):
@@ -135,24 +142,19 @@ def rs_parity(data: bytes, nsym: int) -> bytes:
     if len(data) + nsym > 255:
         raise ValueError("Reed-Solomon block longer than 255 bytes")
     gen = _generator(nsym)
+    gen_log = [_LOG[g] for g in gen[1:]]  # the generator has no zero coefficients
     rem = [0] * nsym
     for byte in data:
         f = byte ^ rem[0]
         rem = rem[1:] + [0]
         if f:
-            for i in range(nsym):
-                rem[i] ^= _mul(gen[i + 1], f)
+            lf = _LOG[f]
+            rem = [r ^ _EXP[g + lf] for r, g in zip(rem, gen_log)]
     return bytes(rem)
 
 
 def _syndromes(block, nsym: int) -> list[int]:
-    out = []
-    for j in range(nsym):
-        x, y = _EXP[j], 0
-        for c in block:
-            y = _mul(y, x) ^ c
-        out.append(y)
-    return out
+    return [_horner(block, _EXP[j]) for j in range(nsym)]
 
 
 def rs_correct(block: bytes, nsym: int, erasures: tuple[int, ...] | list[int] = ()) -> tuple[bytes, int]:
@@ -167,7 +169,7 @@ def rs_correct(block: bytes, nsym: int, erasures: tuple[int, ...] | list[int] = 
     synd = _syndromes(block, nsym)
     if not any(synd):
         return bytes(block[:n - nsym]), 0
-    erasures = sorted(set(e for e in erasures if 0 <= e < n))
+    erasures = sorted({e for e in erasures if 0 <= e < n})
     if len(erasures) > nsym:
         raise Uncorrectable("too many erasures")
     # erasure locator: a root at X^-1 for every erased position X = 2^(n-1-i)
@@ -200,19 +202,19 @@ def rs_correct(block: bytes, nsym: int, erasures: tuple[int, ...] | list[int] = 
     psi = _poly_mul(lam, gamma)
     while len(psi) > 1 and psi[-1] == 0:
         psi.pop()
-    where = [i for i in range(n) if _poly_eval(psi, _EXP[(255 - (n - 1 - i)) % 255]) == 0]
+    inverse = [_EXP[(255 - (n - 1 - i)) % 255] for i in range(n)]  # of each position's X
+    high_first = psi[::-1]
+    where = [i for i in range(n) if _horner(high_first, inverse[i]) == 0]
     if len(where) != len(psi) - 1:
         raise Uncorrectable("error positions don't add up")
     omega = _poly_mul(synd, psi)[:nsym]
     deriv = [psi[i] if i % 2 else 0 for i in range(1, len(psi))]  # formal derivative (characteristic 2)
     fixed = bytearray(block)
     for i in where:
-        x = _EXP[n - 1 - i]
-        x_inv = _EXP[(255 - (n - 1 - i)) % 255]
-        den = _poly_eval(deriv, x_inv)
+        den = _poly_eval(deriv, inverse[i])
         if den == 0:
             raise Uncorrectable("can't size an error")
-        fixed[i] ^= _mul(x, _div(_poly_eval(omega, x_inv), den))
+        fixed[i] ^= _mul(_EXP[n - 1 - i], _div(_poly_eval(omega, inverse[i]), den))
     if any(_syndromes(fixed, nsym)):
         raise Uncorrectable("repair didn't hold")
     return bytes(fixed[:n - nsym]), sum(a != b for a, b in zip(fixed, block))
@@ -250,6 +252,31 @@ def _xor(data: bytes, stream: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, stream))
 
 
+def _seal(key: str, nonce: bytes | None, flags: bytes, length: bytes, payload: bytes) -> tuple[bytes, bytes, bytes]:
+    """Encrypt ``payload``: (nonce, tag, ciphertext). The tag covers flags, nonce, length and ciphertext."""
+    enc_key, mac_key = _keys(key)
+    nonce = nonce if nonce is not None else os.urandom(NONCE_LEN)
+    ct = _xor(payload, _keystream(enc_key, nonce, len(payload)))
+    return nonce, _tag(mac_key, flags + nonce + length, ct), ct
+
+
+def _open(key: str | None, flags: bytes, length: bytes, nonce: bytes, tag: bytes, ct: bytes) -> bytes | None:
+    """The text of an encrypted frame, or None: no key, the wrong key, a decoy,
+    or tampered with. Those are never shown as text."""
+    if not key:
+        return None
+    enc_key, mac_key = _keys(key)
+    if not hmac.compare_digest(tag, _tag(mac_key, flags + nonce + length, ct)):
+        return None
+    return _xor(ct, _keystream(enc_key, nonce, len(ct)))
+
+
+def _message(frame_mode: int, encrypted: bool, payload: bytes, plain: bytes | None, repaired: int = 0) -> Message:
+    if plain is None:
+        return Message(None, frame_mode, True, locked=True, raw=payload, repaired=repaired)
+    return Message(plain.decode("utf-8", errors="replace"), frame_mode, encrypted, raw=plain, repaired=repaired)
+
+
 def _crc(data: bytes) -> bytes:
     return binascii.crc_hqx(data, 0xFFFF).to_bytes(2, "big")
 
@@ -269,11 +296,8 @@ def build_frame(text: str, mode_id: int, key: str | None = None, nonce: bytes | 
     flags = MAGIC | (mode_id << 1) | int(bool(key))
     if not key:
         return _assemble(flags, payload, len(payload))
-    enc_key, mac_key = _keys(key)
-    nonce = nonce if nonce is not None else os.urandom(NONCE_LEN)
-    ct = _xor(payload, _keystream(enc_key, nonce, len(payload)))
-    tag = _tag(mac_key, bytes([flags]) + nonce + bytes([len(payload)]), ct)
-    return _assemble(flags, nonce + tag + ct, len(payload))
+    return _assemble(flags, b"".join(_seal(key, nonce, bytes([flags]), bytes([len(payload)]), payload)),
+                     len(payload))
 
 
 def build_decoy(mode_id: int, length: int) -> bytes:
@@ -283,12 +307,6 @@ def build_decoy(mode_id: int, length: int) -> bytes:
     tag fails, so the receiver drops it."""
     length = max(0, min(length, MAX_PAYLOAD))
     return _assemble(MAGIC | (mode_id << 1) | 1, os.urandom(NONCE_LEN + TAG_LEN + length), length)
-
-
-def frame_length(payload: int, encrypted: bool) -> int:
-    """Bytes on the air for a payload of ``payload`` bytes."""
-    body = (NONCE_LEN + TAG_LEN if encrypted else 0) + payload + 2
-    return HEADER_LEN + body + parity_len(body)
 
 
 def _header(data: bytes) -> tuple[int, int] | None:
@@ -362,17 +380,10 @@ def parse_frame(data: bytes, key: str | None = None, mode_id: int | None = None,
     body, fixed = got
     repaired += fixed
     payload = body[extra:]
+    plain = payload
     if encrypted:
-        if not key:
-            return Message(None, frame_mode, True, locked=True, raw=payload, repaired=repaired), total
-        enc_key, mac_key = _keys(key)
-        nonce, tag = body[:NONCE_LEN], body[NONCE_LEN:extra]
-        if not hmac.compare_digest(tag, _tag(mac_key, bytes([flags]) + nonce + bytes([length]), payload)):
-            # wrong key, a decoy, or tampered with: never show it as text
-            return Message(None, frame_mode, True, locked=True, raw=payload, repaired=repaired), total
-        payload = _xor(payload, _keystream(enc_key, nonce, len(payload)))
-    return Message(payload.decode("utf-8", errors="replace"), frame_mode, encrypted, raw=payload,
-                   repaired=repaired), total
+        plain = _open(key, bytes([flags]), bytes([length]), body[:NONCE_LEN], body[NONCE_LEN:extra], payload)
+    return _message(frame_mode, encrypted, payload, plain, repaired), total
 
 
 # -- version 1 (no error correction): read for friends who haven't updated ----
@@ -388,10 +399,7 @@ def _build_frame_v1(text: str, mode_id: int, key: str | None = None, nonce: byte
     length = len(payload).to_bytes(2, "big")
     if not key:
         return _finish_v1(flags + length, payload)
-    enc_key, mac_key = _keys(key)
-    nonce = nonce if nonce is not None else os.urandom(NONCE_LEN)
-    ct = _xor(payload, _keystream(enc_key, nonce, len(payload)))
-    tag = _tag(mac_key, flags + nonce + length, ct)
+    nonce, tag, ct = _seal(key, nonce, flags, length, payload)
     return _finish_v1(flags + nonce + tag + length, ct)
 
 
@@ -422,16 +430,8 @@ def _parse_frame_v1(data: bytes, key: str | None = None, mode_id: int | None = N
     if _crc(body) != data[pos + length:total]:
         raise BadFrame("crc mismatch")
     payload = data[pos:pos + length]
-
-    if encrypted:
-        if not key:
-            return Message(None, frame_mode, True, locked=True, raw=payload), total
-        enc_key, mac_key = _keys(key)
-        header = data[:1] + nonce + data[pos - 2:pos]
-        if not hmac.compare_digest(tag, _tag(mac_key, header, payload)):
-            return Message(None, frame_mode, True, locked=True, raw=payload), total
-        payload = _xor(payload, _keystream(enc_key, nonce, len(payload)))
-    return Message(payload.decode("utf-8", errors="replace"), frame_mode, encrypted, raw=payload), total
+    plain = _open(key, data[:1], data[pos - 2:pos], nonce, tag, payload) if encrypted else payload
+    return _message(frame_mode, encrypted, payload, plain), total
 
 
 CHUNK_BYTES = 160  # per frame: each frame has its own sync chirp, so long text re-syncs often

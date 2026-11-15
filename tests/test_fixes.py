@@ -508,3 +508,21 @@ def test_screech_tones_are_told_from_speech():
         flags = [modem.looks_like_screech(x[i:i + 1920]) for i in range(0, len(x) - 1920, 1920)]
         assert np.mean(flags) < 0.1, name
     assert not modem.looks_like_screech(np.zeros(1920, np.float32))
+
+
+def test_sixteen_bit_sound_survives_the_pipe():
+    # one conversion for pacat, parec, WAV files and Vosk: full scale stays in range, odd bytes are dropped
+    x = np.array([0.0, 0.5, -0.5, 1.0, -1.0, 3.0, -3.0], np.float32)
+    raw = audio.to_pcm16(x)
+    assert np.frombuffer(raw, "<i2").tolist() == [0, 16383, -16383, 32767, -32767, 32767, -32767]
+    assert np.allclose(audio.from_pcm16(raw), np.clip(x, -1, 1), atol=1e-4)
+    assert len(audio.from_pcm16(raw + b"\x01")) == len(x)  # a read that ended mid-sample
+
+
+def test_what_counts_as_a_microphone_and_how_apps_are_named():
+    assert all(pulse.is_ours(n) for n in ("binharic_mic", "binharic_out.monitor", "alsa_output.pci.monitor"))
+    assert not pulse.is_ours("alsa_input.usb-Blue_Yeti.analog-stereo")
+    assert pulse.app_label({"application.name": "Firefox", "media.name": "Discord | @friend"}) == \
+        "Firefox · Discord | @friend"
+    assert pulse.app_label({"application.name": "mpv", "media.name": "mpv"}) == "mpv"
+    assert pulse.app_label({}) == "an app"

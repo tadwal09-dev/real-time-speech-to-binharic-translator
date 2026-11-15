@@ -1,7 +1,7 @@
 # Handoff: where we left off
 
 Read this first in a new session, then the README for what the user sees.
-Last updated: 2026-11-14 on branch `claude/happy-gates-btt1f9`.
+Last updated: 2026-11-15 on branch `claude/happy-gates-btt1f9`.
 
 ## What this is
 
@@ -23,7 +23,29 @@ All of that is built and was tested against a simulated desktop (see below). **I
 yet worked end to end on the user's real machine.** The latest report, below, is the
 current blocker.
 
-## Status after the latest session (2026-11-14): decoding over a call, `binharic update`, 0.5.0
+## Status after the latest session (2026-11-15): clean-up and speed, 0.5.1
+
+The user asked to "scan the whole codebase and optimize it, removing any redundant code, then
+test it". No behaviour changed; frames and decoding are bit-for-bit what 0.5.0 does.
+
+- **Speed.** It was already fast (a 13 s message decoded in 0.1 s). The chirp, its spectrum and
+  the tone tables are now cached, the demodulator's per-symbol loops are vectorised and the
+  Reed-Solomon inner loops use the log tables directly: decoding takes 20–40% less time, the
+  idle live decoder about 30% less.
+- **Removed** (unused): `modem.encode_body`, `codec.frame_length`, `pulse.sinks`/`sources`,
+  `stt._words`, the TUI's `peak`.
+- **Merged duplicates**: encrypt/decrypt for both frame versions (`codec._seal`/`_open`/
+  `_message`), float ↔ 16-bit PCM (`audio.to_pcm16`/`from_pcm16`, was in five places),
+  "is this a real mic" (`pulse.is_ours`), stream names (`pulse.app_label`), the mic-meter
+  curve (`core.meter`), key/decoys of a one-off message (`cli._sending`), the `say`/`ish`
+  options (`cli._message_options`), log + popup (`Translator._announce`), the parec command.
+- **How it was checked**: old and new modem/codec compared on 60 randomly damaged recordings
+  (cuts, repeats, concealment, noise; three sample rates; with, without and with the wrong
+  key): same symbols, doubts, end positions and messages, and 3000 Reed-Solomon blocks gave
+  the same result or the same refusal. `test_frame_bytes_never_change` now pins the bytes
+  on the air for both frame versions.
+
+## Status the session before (2026-11-14): decoding over a call, `binharic update`, 0.5.0
 
 The user asked to "fix any bugs, build an update handler into it so one command checks for
 updates and updates, and fix the decoding". `experimental` (below) had never been shipped or

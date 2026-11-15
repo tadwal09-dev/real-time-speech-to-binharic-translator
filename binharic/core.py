@@ -26,7 +26,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
@@ -123,6 +123,11 @@ PRIVACY = {
     "decoys": "sending ENCRYPTED + gibberish: only key holders can read you or tell which chirp is real",
 }
 
+def meter(level: float) -> float:
+    """A mic level as the filled part of a meter, 0..1 (quiet speech still shows)."""
+    return min(1.0, (level * 12) ** 0.6)
+
+
 Event = dict
 Listener = Callable[[str, Event], None]
 
@@ -186,6 +191,16 @@ class Translator:
     def log(self, text: str, level: str = "info") -> None:
         self.emit("log", text=text, level=level)
 
+    def _warn(self, text: str) -> None:
+        self.log(text, "warn")
+
+    def _announce(self, text: str) -> None:
+        """A change you made, maybe by hotkey with no window in sight: log it and pop it up."""
+        self.log(text)
+        if self.s.notify:
+            desktop_notify(text)
+        self._changed()
+
     def status(self) -> dict:
         d = self.s.public()
         d.update(ready=self.ready, engine_name=self.engine_name, speaking=self.speaking,
@@ -211,12 +226,8 @@ class Translator:
             self._abort.set()
             with self._pending_lock:
                 self._pending.clear()
-        msg = "ON: voice muted, speaking binharic" if on else "OFF" + (
-            ": voice passes through" if self.s.passthrough else ": silent")
-        self.log(msg)
-        if self.s.notify:
-            desktop_notify(msg)
-        self._changed()
+        self._announce("ON: voice muted, speaking binharic" if on else "OFF" + (
+            ": voice passes through" if self.s.passthrough else ": silent"))
 
     def toggle(self) -> None:
         self.set_enabled(not self.s.enabled)
@@ -229,15 +240,11 @@ class Translator:
         self.s.send_mode = mode
         if self.transcriber:
             self.transcriber.send_mode = mode
-        msg = "sending as you talk" if mode == LIVE else "sending after you finish"
-        self.log(msg)
-        if self.s.notify:
-            desktop_notify(msg)
+        self._announce("sending as you talk" if mode == LIVE else "sending after you finish")
         if mode == LIVE and not self.full_duplex and not self._warned_half:
             self._warned_half = True
-            self.log("mic is ignored while screeching (no virtual sink); use --duplex full "
-                     "if your speakers can't feed back", "warn")
-        self._changed()
+            self._warn("mic is ignored while screeching (no virtual sink); use --duplex full "
+                       "if your speakers can't feed back")
 
     def set_mode(self, mode: str) -> None:
         modem.get_mode(mode)
@@ -325,11 +332,12 @@ class Translator:
         if self.s.control_socket:
             self._start_control()  # first, so a second copy fails before touching audio
         self._resolve_devices()
-        warn = lambda m: self.log(m, "warn")  # noqa: E731
         on_pulse = self._on_pulse
-        self._out = Output(SR, sink=(self.s.sink if on_pulse else None) or (self.speakers if on_pulse else None), device=self.s.output_device, blocksize=BLOCK,
-                           notify=warn, before_reconnect=self._recreate_virtual_mic)
-        self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2, notify=warn)
+        self._out = Output(SR, sink=(self.s.sink or self.speakers) if on_pulse else None,
+                           device=self.s.output_device, blocksize=BLOCK, notify=self._warn,
+                           before_reconnect=self._recreate_virtual_mic)
+        self._mic = Input(SR, source=self.s.source, device=self.s.input_device, blocksize=BLOCK * 2,
+                          notify=self._warn)
         out = pulse.describe(self.s.sink, "sinks") if self.s.sink else self.speakers_label
         self.log(f"mic: {self.mic_label}  →  screech: {out}"
                  + (f"  (test mode plays on: {self.speakers_label})" if self.s.test and self.s.sink else ""))
@@ -367,7 +375,7 @@ class Translator:
                 closer and closer.close()
             except Exception:
                 pass
-        for out in {id(o): o for o in (self._out, self._local_out) if o}.values():
+        for out in self._outputs():
             try:
                 out.close()
             except Exception:
@@ -378,6 +386,10 @@ class Translator:
                 socket_path().unlink()
             except FileNotFoundError:
                 pass
+
+    def _outputs(self) -> list[Output]:
+        """The open outputs: the screech's, and test mode's speakers when they're another one."""
+        return list({id(o): o for o in (self._out, self._local_out) if o}.values())
 
     def wait(self) -> None:
         while not self._stop.is_set():
@@ -480,7 +492,7 @@ class Translator:
         them before reconnecting to them."""
         if self.s.sink == pulse.SINK and not pulse.virtual_mic_exists():
             pulse.mic_up()
-            self.log("re-created the Binharic Mic after the sound server restarted", "warn")
+            self._warn("re-created the Binharic Mic after the sound server restarted")
 
     # -- threads ----------------------------------------------------------
     def _mic_loop(self):
@@ -643,7 +655,7 @@ class Translator:
         with self._target_lock:  # the GUI thread and the output thread can both get here
             if self._local_out is None:
                 self._local_out = Output(SR, sink=self.speakers, device=self._speaker_device, blocksize=BLOCK,
-                                         notify=lambda m: self.log(m, "warn"))
+                                         notify=self._warn)
         return self._local_out
 
     def _out_loop(self):
@@ -654,7 +666,7 @@ class Translator:
             now = time.monotonic()
             if now - checked > 0.5:  # reconnect as soon as the sound server comes back
                 checked = now
-                for o in {id(o): o for o in (self._out, self._local_out) if o}.values():
+                for o in self._outputs():
                     o.ensure_alive()
             item = self._take_pending()
             if item:
@@ -740,31 +752,29 @@ class Translator:
 
     def _air_loop(self):
         """Test mode: decode the screech as the mic heard it from the speakers."""
+        def report(messages):
+            for m in messages:
+                if not (m.locked and self.s.key):  # that would be a decoy
+                    self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
+
         dec = None
         while not self._stop.is_set():
             try:
                 block = self._air_q.get(timeout=0.3)
             except queue.Empty:
                 if dec is not None and not self.screeching.is_set() and time.monotonic() > self._mute_until:
-                    for m in dec.flush():  # the tail of the screech may still be unscanned
-                        if m.locked and self.s.key:
-                            continue
-                        self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked,
-                                  decode_ms=0.0)
+                    report(dec.flush())  # the tail of the screech may still be unscanned
                     dec = None  # this attempt is over; start clean for the next screech
                 continue
             if dec is None:
                 dec = modem.StreamDecoder(SR, "auto", key=self.s.key, speed=self.s.speed)
-            for m in dec.feed(block):
-                if m.locked and self.s.key:
-                    continue  # a decoy
-                self.emit("verify", via="air", sent=None, decoded=m.display(), ok=not m.locked, decode_ms=0.0)
+            report(dec.feed(block))
 
     def _hear_loop(self):
         key = self.s.hear_key or self.s.key
         if self._on_pulse:
             return self._hear_incoming(key)
-        self._hear_in = Input(SR, device=self._hear_device, blocksize=BLOCK * 5, notify=lambda m: self.log(m, "warn"))
+        self._hear_in = Input(SR, device=self._hear_device, blocksize=BLOCK * 5, notify=self._warn)
         dec = modem.StreamDecoder(SR, "auto", key=key, speed=self.s.speed)
         announced = False
         while not self._stop.is_set():
@@ -786,7 +796,7 @@ class Translator:
         name = pulse.speakers_monitor() if speakers else self.s.hear
         label = "your speakers" if speakers else pulse.describe(name, "sources")
         inc = Incoming(SR, [(label, name)] if name else [], apps=speakers, key=key, speed=self.s.speed,
-                       notify=lambda m: self.log(m, "warn"))
+                       notify=self._warn)
         self._hear_in = inc
         inc.start()
         while not inc.wait_flowing(0.2):  # only once audio really arrives: earlier messages would be missed
@@ -860,7 +870,7 @@ class Translator:
         while not self._stop.is_set():
             try:
                 conn, _ = self._sock.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break

@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,7 @@ import numpy as np
 
 from . import modem, osinfo
 
+SELF_TEST = "binharic self test"
 SPEAK_SECONDS = 3.0
 HEARD = 0.01     # a peak this loud while you talk = the mic hears you
 ALIVE = 3e-4     # anything above digital silence = the mic delivers audio
@@ -193,8 +195,7 @@ class Fixer:
 
     def _mic_candidates(self) -> list[str]:
         from . import pulse
-        ours = lambda n: n == pulse.MIC or n.endswith(".monitor") or n.startswith(pulse.SINK)  # noqa: E731
-        names = [d["name"] for d in pulse._info("sources") if not ours(d["name"])]
+        names = [d["name"] for d in pulse._info("sources") if not pulse.is_ours(d["name"])]
         default = pulse.real_source()
         names.sort(key=lambda n: (n != default, n.startswith("bluez")))  # default first
         return names
@@ -269,7 +270,6 @@ class Fixer:
         from . import pulse
         from .audio import Input, Output
         sr = 48000
-        text = "binharic self test"
         try:
             rec = Input(sr, source=pulse.MIC, blocksize=sr // 10)
             out = Output(sr, sink=pulse.SINK)
@@ -277,27 +277,24 @@ class Fixer:
             self.bad(f"can't open the virtual mic: {e}", "run `binharic mic down && binharic mic up`")
             return
         got: list[np.ndarray] = []
-        done = [False]
-
-        import threading
+        done = threading.Event()
 
         def record():
-            while not done[0]:
+            while not done.is_set():
                 try:
                     got.append(rec.read())
                 except EOFError:
                     return
-        t = threading.Thread(target=record, daemon=True)
-        t.start()
+        threading.Thread(target=record, daemon=True).start()
         time.sleep(0.3)
-        out.write(modem.encode_text(text, "binharic", sr=sr))
+        out.write(modem.encode_text(SELF_TEST, "binharic", sr=sr))
         out.write(np.zeros(sr // 2, dtype=np.float32))
         time.sleep(0.8)
-        done[0] = True
+        done.set()
         out.close()
         rec.close()
         heard = [m.text for m in modem.decode_audio(np.concatenate(got) if got else np.zeros(1), sr)]
-        if text in heard:
+        if SELF_TEST in heard:
             self.ok("a test screech went into the Binharic Mic and decoded perfectly - Discord will get it")
         else:
             self.bad("the test screech didn't come out of the Binharic Mic",
@@ -321,21 +318,19 @@ class Fixer:
             self.bad("VB-Audio Virtual Cable isn't installed (needed to send the screech to Discord)",
                      f"download it from {pa.CABLE_URL}, run its setup as administrator, reboot, run `binharic fix`")
             if osinfo.WINDOWS and self.ask("open the download page now?"):
-                os.startfile(pa.CABLE_URL)  # noqa: S606 (Windows only)
+                os.startfile(pa.CABLE_URL)  # Windows only
 
         self.step("microphone")
         inputs = pa.real_inputs()
         if not inputs:
             self.bad("no microphone found", "plug one in, and check Settings -> Privacy -> Microphone")
             return
-        seen, uniq = set(), []
+        uniq: dict[str, dict] = {}
         for d in inputs:  # Windows lists each mic once per audio API: test each name once
-            if d["name"] not in seen:
-                seen.add(d["name"])
-                uniq.append(d)
+            uniq.setdefault(d["name"], d)
         self.countdown("testing your microphones")
         best = (0.0, None)
-        for d in uniq:
+        for d in uniq.values():
             peak = pa.probe_input(d["index"], SPEAK_SECONDS)
             self.say(f"   ..    {d['name']}: " + ("can't record from it" if peak is None else f"level {peak:.3f}"))
             if peak is not None and peak > best[0]:
@@ -360,8 +355,7 @@ class Fixer:
         cable_in, cable_out = pa.find_cable(), pa.find_cable_output()
         if cable_out is None:
             return
-        text = "binharic self test"
-        sig = np.concatenate([np.zeros(sr // 4), modem.encode_text(text, "binharic", sr=sr), np.zeros(sr // 2)])
+        sig = np.concatenate([np.zeros(sr // 4), modem.encode_text(SELF_TEST, "binharic", sr=sr), np.zeros(sr // 2)])
         try:
             rec = sd.playrec(sig.reshape(-1, 1), samplerate=sr, channels=1, dtype="float32",
                              device=(cable_out, cable_in))
@@ -369,7 +363,7 @@ class Fixer:
         except Exception as e:
             self.bad(f"couldn't play/record through the cable: {e}")
             return
-        if text in [m.text for m in modem.decode_audio(rec[:, 0], sr)]:
+        if SELF_TEST in [m.text for m in modem.decode_audio(rec[:, 0], sr)]:
             self.ok("a test screech went through the cable and decoded perfectly - Discord will get it")
         else:
             self.bad("the test screech didn't come through the cable",

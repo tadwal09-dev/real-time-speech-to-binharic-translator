@@ -95,11 +95,7 @@ sed "s|^Exec=binharic |Exec=$BIN |" contrib/binharic.desktop > ~/.local/share/ap
 systemctl --user daemon-reload 2>/dev/null || true
 
 step "speech models ($ENGINE)"
-if [[ $ENGINE == whisper ]]; then
-  retry "$BIN" download-model --engine whisper || fail "model download failed (network?) - rerun ./install.sh"
-else
-  retry "$BIN" download-model --engine vosk || fail "model download failed (network?) - rerun ./install.sh"
-fi
+retry "$BIN" download-model --engine "$ENGINE" || fail "model download failed (network?) - rerun ./install.sh"
 
 step "creating the Binharic Mic"
 "$BIN" mic up || echo "!! couldn't create it now - is PipeWire running? try later: binharic mic up"
@@ -107,10 +103,9 @@ step "creating the Binharic Mic"
 if [[ -n $UPDATE ]]; then
   echo; "$BIN" --version
   exit 0  # `binharic update`: the setup was already checked when it was installed
-else
-  step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
-  if [[ -n "${BINHARIC_NO_GPU:-}" ]]; then "$BIN" fix --no-gpu || true; else "$BIN" fix || true; fi
 fi
+step "finding and fixing problems (it will ask you to talk; downloads GPU libraries if you have NVIDIA)"
+"$BIN" fix ${BINHARIC_NO_GPU:+--no-gpu} || true
 
 if [[ -z $GLOBAL_OK && ":$PATH:" != *":$BIN_DIR:"* ]]; then
   printf '\n\033[1;33m%s is not on your PATH.\033[0m Add it with:\n' "$BIN_DIR"

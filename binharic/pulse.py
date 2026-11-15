@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 
 SINK = "binharic_out"
 MIC = "binharic_mic"
+_FAILED = (RuntimeError, subprocess.CalledProcessError, OSError)  # no pactl, it said no, or it wouldn't run
 
 
 def _pactl(*args: str) -> str:
@@ -20,35 +22,27 @@ def _names(kind: str) -> list[str]:
     return [line.split("\t")[1] for line in _pactl("list", "short", kind).splitlines() if "\t" in line]
 
 
-def sinks() -> list[str]:
-    return _names("sinks")
-
-
-def sources() -> list[str]:
-    return _names("sources")
-
-
 def available() -> bool:
     try:
         _pactl("info")
         return True
-    except (RuntimeError, subprocess.CalledProcessError, OSError):
+    except _FAILED:
         return False
 
 
 def virtual_mic_exists() -> bool:
     try:
-        return SINK in sinks() and MIC in sources()
-    except (RuntimeError, subprocess.CalledProcessError, OSError):
+        return SINK in _names("sinks") and MIC in _names("sources")
+    except _FAILED:
         return False
 
 
 def mic_up() -> None:
     before_sink, before_source = _default("sink"), _default("source")
-    if SINK not in sinks():
+    if SINK not in _names("sinks"):
         _pactl("load-module", "module-null-sink", f"sink_name={SINK}",
                "sink_properties=device.description=Binharic_Output")
-    if MIC not in sources():
+    if MIC not in _names("sources"):
         _pactl("load-module", "module-remap-source", f"master={SINK}.monitor", f"source_name={MIC}",
                "source_properties=device.description=Binharic_Mic")
     # PipeWire can make a brand-new device the default. Then all your other
@@ -60,7 +54,7 @@ def mic_up() -> None:
         if before_source and before_source not in (MIC, f"{SINK}.monitor") and \
                 _default("source") in (MIC, f"{SINK}.monitor"):
             _pactl("set-default-source", before_source)
-    except (RuntimeError, subprocess.CalledProcessError, OSError):
+    except _FAILED:
         pass
 
 
@@ -111,8 +105,8 @@ def resolve_source(value: str | None) -> str | None:
 def check_device(name: str, kind: str) -> None:
     """Raise a helpful error if a sink/source name doesn't exist."""
     try:
-        names = sinks() if kind == "sinks" else sources()
-    except (RuntimeError, subprocess.CalledProcessError, OSError):
+        names = _names(kind)
+    except _FAILED:
         return  # can't tell; pacat/parec will report it
     if name not in names:
         what = "output (sink)" if kind == "sinks" else "input (source)"
@@ -167,11 +161,21 @@ def misrouted_mic_streams() -> list[tuple[int, str, str | None]]:
             p = st.get("properties", {})
             # PulseAudio has no target.object: there apps stay where they were put
             if str(p.get("target.object")) in (MIC, str(mic)) and st.get("source") != mic:
-                app = " · ".join(dict.fromkeys(filter(None, (p.get("application.name"), p.get("media.name")))))
-                out.append((st["index"], app or "an app", names.get(st.get("source"))))
+                out.append((st["index"], app_label(p), names.get(st.get("source"))))
         return out
     except Exception:  # an old pactl without -f json, or the server is going away
         return []
+
+
+def app_label(properties: dict) -> str:
+    """"app · what it plays" for a stream's properties."""
+    parts = (properties.get("application.name"), properties.get("media.name"))
+    return " · ".join(dict.fromkeys(filter(None, parts))) or "an app"
+
+
+def is_ours(name: str) -> bool:
+    """Not a microphone: our virtual devices, or a monitor of some output."""
+    return name == MIC or name.endswith(".monitor") or name.startswith(SINK)
 
 
 def describe(name: str | None, kind: str) -> str:
@@ -194,11 +198,10 @@ def real_source() -> str | None:
     created device), in which case the first real input."""
     if not available():
         return None
-    ours = lambda n: n == MIC or n.endswith(".monitor") or n.startswith(SINK)  # noqa: E731
     d = _default("source")
-    if d and not ours(d):
+    if d and not is_ours(d):
         return d
-    return _best([s["name"] for s in _info("sources") if not ours(s["name"])], ("alsa_input", "bluez_input"))
+    return _best([s["name"] for s in _info("sources") if not is_ours(s["name"])], ("alsa_input", "bluez_input"))
 
 
 def _best(names: list[str], hardware: tuple[str, ...]) -> str | None:
@@ -223,7 +226,6 @@ def probe_source(name: str, seconds: float = 1.0, rate: int = 16000) -> float | 
     """Record briefly and return the peak level (0..1), or None if recording failed."""
     if not shutil.which("parec"):
         return None
-    import time
     try:
         p = subprocess.Popen(["parec", f"--device={name}", "--raw", "--format=s16le", f"--rate={rate}", "--latency-msec=20",
                               "--channels=1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -234,6 +236,5 @@ def probe_source(name: str, seconds: float = 1.0, rate: int = 16000) -> float | 
     raw, _ = p.communicate(timeout=3)
     if len(raw) < 2:
         return None
-    import numpy as np
-    x = np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2")
-    return float(np.abs(x).max()) / 32768.0
+    from .audio import from_pcm16
+    return float(abs(from_pcm16(raw)).max())

@@ -26,10 +26,11 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
+from .audio import to_pcm16
 from .vad import EnergyVAD
 
 STT_SR = 16000
@@ -233,8 +234,7 @@ class VoskEngine(Engine):
         self._done = ""
 
     def feed(self, audio, want_hypothesis):
-        pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
-        if self.rec.AcceptWaveform(pcm):
+        if self.rec.AcceptWaveform(to_pcm16(audio)):
             self._done = _clean(self._done + " " + json.loads(self.rec.Result()).get("text", ""))
             partial = ""
         else:
@@ -319,10 +319,6 @@ def download(engine: str = "whisper", model: str | None = None) -> str:
 
 # --------------------------------------------------------------------------
 # utterance pipeline
-
-def _words(text: str) -> list[str]:
-    return text.split()
-
 
 def _norm(w: str) -> str:
     return re.sub(r"[^\w']", "", w.lower())
@@ -452,7 +448,7 @@ class Transcriber:
             self.on_partial(hyp)
         if self.send_mode != LIVE:
             return
-        words = _words(hyp)
+        words = hyp.split()
         # the newest word may be cut off mid-way ("omni" for "omnissiah"): only
         # commit words that two hypotheses agree on *and* that aren't the last
         stable = min(agreed_prefix(self._prev, words), len(words) - 1)
@@ -475,7 +471,7 @@ class Transcriber:
             text = self.engine.finish(fast=self.send_mode == LIVE)
             self.last_stt_ms, self.last_speculative = (time.monotonic() - t) * 1000, False
         self._spec, self._paused = None, False
-        words = _words(text)
+        words = text.split()
         if self.send_mode == LIVE:
             # the final pass may reword or re-split things; send only what
             # comes after the words already screeched

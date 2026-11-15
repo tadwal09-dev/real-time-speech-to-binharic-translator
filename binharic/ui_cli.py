@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 
-from .core import Translator
+from .core import Translator, meter
 from .stt import LIVE
 
 try:
@@ -60,7 +60,7 @@ class Printer:
         with self._lock:
             if self._partial and self._partial != "\0meter":
                 return  # a live transcript is showing; leave it
-            n = int(min(1.0, (level * 12) ** 0.6) * 24)
+            n = int(meter(level) * 24)
             state = "\033[33mhearing you…\033[0m" if self._speaking else "\033[2msay something\033[0m"
             sys.stdout.write(f"\r\033[K  mic \033[32m{'█' * n}\033[2m{'░' * (24 - n)}\033[0m {state}")
             sys.stdout.flush()

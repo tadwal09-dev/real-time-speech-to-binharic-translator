@@ -117,3 +117,28 @@ def test_live_decoder_never_drops_unsearched_audio():
             got = [m.text for i in range(0, len(sig), block) for m in dec.feed(sig[i:i + block])]
             got += [m.text for m in dec.flush()]
             assert got == ["never lost"], (lead, block, got)
+
+
+# the exact bytes on the air, from 0.5.0: a clean-up of codec.py must not change them
+# (copies already in use couldn't read us any more). (mode id, key) -> (version 2, version 1)
+GOLDEN = {
+    (2, None): ("c4124dc693ce6861696c20746865206f6d6e69737369616860e1863486b1189d30dca3de",
+                "b400126861696c20746865206f6d6e69737369616872fb"),
+    (1, "cant"): ("c312797e9741000102030405b3e7fd67aa07ac6d263ffbb0e2996b980e0bd90a696537bd40cf664fe7a63addac9efad73107",
+                  "b30001020304058c197b415f8c0012ac6d263ffbb0e2996b980e0bd90a696537bdc6d6"),
+    (0, "cant"): ("c112bfd02e920001020304052b076d5ea606ac6d263ffbb0e2996b980e0bd90a696537bd21197b76429e7d256b06c452b10e",
+                  "b1000102030405ffeb87812c240012ac6d263ffbb0e2996b980e0bd90a696537bd8eb8"),
+}
+
+
+@pytest.mark.parametrize("mode_id,key", list(GOLDEN))
+def test_frame_bytes_never_change(mode_id, key):
+    text, nonce = "hail the omnissiah", bytes(range(6))
+    for version, want in zip((2, 1), GOLDEN[mode_id, key]):
+        frame = codec.build_frame(text, mode_id, key, nonce, version=version)
+        assert frame.hex() == want
+        m, used = codec.parse_frame(bytes.fromhex(want), key, mode_id)
+        assert (m.text, m.locked, used, m.repaired) == (text, False, len(frame), 0)
+        if key:
+            assert codec.parse_frame(frame, "wrong", mode_id)[0].locked
+            assert codec.parse_frame(frame, None, mode_id)[0].locked

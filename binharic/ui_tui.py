@@ -9,7 +9,7 @@ import time
 from collections import deque
 
 from . import modem
-from .core import Translator
+from .core import Translator, meter
 from .stt import LIVE
 
 KEYS = [("space", "on/off"), ("l", "finish ⇄ live"), ("x", "test"), ("m", "mode"), ("k", "key"),
@@ -23,7 +23,6 @@ class Dashboard:
         self.log: deque[tuple[str, str, str]] = deque(maxlen=300)  # (time, kind, text)
         self.partial = ""
         self.level = 0.0
-        self.peak = 0.0
         tr.subscribe(lambda k, e: self.events.put((k, e)))
 
     # -- event pump --------------------------------------------------------
@@ -89,10 +88,8 @@ class Dashboard:
             x += len(val) + 3
 
         # mic meter
-        self.peak = max(self.level, self.peak * 0.92)
         width = max(10, w - 34)
-        lvl = min(1.0, (self.level * 12) ** 0.6)
-        filled = int(lvl * width)
+        filled = int(meter(self.level) * width)
         put(4, 1, "mic ", curses.A_DIM)
         put(4, 5, "█" * filled, C(2) if self.tr.speaking else C(5))
         put(4, 5 + filled, "░" * (width - filled), curses.A_DIM)
